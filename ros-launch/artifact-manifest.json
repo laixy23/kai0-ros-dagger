@@ -1,0 +1,51 @@
+{
+  "source_commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+  "collector_mode": "isolated SSH compatibility copy",
+  "deployment_root": "/home/rie/dev/xingyu.lai/kai0-official-dagger",
+  "realsense_launch_reference": "IntelRealSense/realsense-ros@2.3.2",
+  "hardware_run": false,
+  "static_checks": [
+    "2 launch XML files parse",
+    "probe Python and embedded ABI-check Python parse",
+    "2 Bash scripts parse",
+    "wrapper usage guards return 2 before activation/hardware",
+    "ABI check accepts ROS env + catkin overlay and rejects foreign model venv",
+    "wrapper arguments accepted by compatibility collector argparse function",
+    "motion/stop operator notes and isolated ROS_LOG_DIR configured"
+  ],
+  "files": [
+    {
+      "path": "README_OFFICIAL_ROS.txt",
+      "sha256": "650a6d3854b944eb0d2a1de48d72119f47cbaff4566ac4c4d2d34fcf435c43ea",
+      "bytes": 10149
+    },
+    {
+      "path": "arms_official_wj_dev.launch",
+      "sha256": "54bc38f25f84494c24e999f3ab72a289da01171882dcec09976a198864975a33",
+      "bytes": 472
+    },
+    {
+      "path": "cameras_wj_dev.launch",
+      "sha256": "291ccfbba93d696025e6d1a33ea8c318860ef9f880db98f736f3dc140f2305e1",
+      "bytes": 2664
+    },
+    {
+      "path": "probe_official_topics.py",
+      "sha256": "c94f502377ee23ca028eb6f4b4e3433df312d62bb496ed92a0628a77abede483",
+      "bytes": 2734
+    },
+    {
+      "path": "run_official_collector.sh",
+      "sha256": "c6f49f0fd4642f3a5b123ada5997efcef05f121f2fb7616c4b051883bc5d33a2",
+      "bytes": 2040
+    },
+    {
+      "path": "run_ros.sh",
+      "sha256": "99458efdbda4b70b5e4499ddb223858ea110762a7b4992f799b4b9824ee14c20",
+      "bytes": 3532
+    }
+  ],
+  "compatibility_collector_sha256": "0a68a614bc8b3ad37d88a9d97070db9bd1c69b5a3512055a09556689134ce197",
+  "compatibility_collect_data_sha256": "7ab8a3fc5503654ad95fda227b651d842ee3eebe6538bea907aaae420b3b5c38",
+  "camera_runtime": "realsense-ros 2.3.2 (ROS1) + SDK2.56.2 native V4L2/udev"
+}

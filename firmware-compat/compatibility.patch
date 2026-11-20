@@ -1,0 +1,53 @@
+--- a/ros_ws/src/piper/scripts/piper_start_ms_node_new.py
++++ b/ros_ws/src/piper/scripts/piper_start_ms_node_new.py
+@@ -16,7 +16,7 @@
+ import argparse
+ import math
+ from piper_sdk import *
+-from piper_sdk import C_PiperInterface
++from piper_sdk import C_PiperInterface_V3
+ from piper_msgs.msg import PiperStatusMsg, PosCmd
+ from geometry_msgs.msg import Pose,PoseStamped, Twist
+ from std_srvs.srv import Trigger, TriggerResponse
+@@ -109,7 +109,7 @@
+         self.joint_state_master.velocity = [0.0] * 7
+         self.joint_state_master.effort = [0.0] * 7
+ 
+-        self.piper = C_PiperInterface(can_name=self.can_port)
++        self.piper = C_PiperInterface_V3(can_name=self.can_port)
+         self.piper.ConnectPort()
+         
+         # 🆕 新增：mode=0时初始化机械臂配置
+--- a/setup/prepare_follower_mode.py
++++ b/setup/prepare_follower_mode.py
+@@ -37,6 +37,8 @@
+         require(-0.05 <= age <= MAX_AGE_S and stamp >= since_timestamp,
+                 f"Stale/pre-command feedback: 0x{key:03X}, age={age:.4f}")
+         ages[f"0x{key:03X}"] = age
++    gripper_mode = frames[0x2A8][0][7]
++    require(gripper_mode == 0, f"V3 gripper mode must be WIDTH(0), got {gripper_mode}; no automatic mode change")
+     status = frames[0x2A1][0]
+     errors = int.from_bytes(status[6:8], "big")
+     foc = [frames[key][0][5] for key in range(0x261, 0x267)]
+@@ -44,7 +46,7 @@
+     require(not any(value & 0xBF for value in foc), f"Motor driver fault: {foc}")
+     joints = [value for key in (0x2A5, 0x2A6, 0x2A7)
+               for value in struct.unpack(">ii", frames[key][0])]
+-    return {"ctrl_mode": status[0], "arm_status": status[1], "err_code": errors,
++    return {"ctrl_mode": status[0], "arm_status": status[1], "err_code": errors, "gripper_mode": gripper_mode,
+             "joint_mdeg": joints, "gripper_um": struct.unpack(">i", frames[0x2A8][0][:4])[0],
+             "driver_enabled": [bool(value & 0x40) for value in foc],
+             "driver_foc_bytes": foc, "component_age_s": ages, "timestamp_sec": now}
+@@ -74,9 +76,9 @@
+ 
+ 
+ def make_sdk(channel):
+-    require(importlib.metadata.version("piper_sdk") == "0.6.2", "Expected piper_sdk 0.6.2")
+-    from piper_sdk import C_PiperInterface_V2
+-    return C_PiperInterface_V2(can_name=channel)
++    require(importlib.metadata.version("piper_sdk") == "0.7.0a1", "Expected piper_sdk 0.7.0a1")
++    from piper_sdk import C_PiperInterface_V3
++    return C_PiperInterface_V3(can_name=channel)
+ 
+ 
+ def prepare(channel, apply=False, allow_reset=False, *, reader=sample_feedback,

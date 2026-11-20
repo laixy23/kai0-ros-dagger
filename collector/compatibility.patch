@@ -1,0 +1,1634 @@
+--- a/agilex_openpi_dagger_collect.py
++++ b/agilex_openpi_dagger_collect.py
+@@ -12,6 +12,8 @@
+ import termios
+ import tty
+ import select
++import math
++from pathlib import Path
+ 
+ import cv2
+ import numpy as np
+@@ -24,7 +26,6 @@
+ from piper_msgs.msg import PosCmd
+ from sensor_msgs.msg import Image, JointState
+ from std_msgs.msg import Header, Bool, String, Int32
+-from pynput import keyboard
+ 
+ import os
+ import h5py
+@@ -32,14 +33,24 @@
+ import collections
+ from collect_data import save_data, create_video_from_images, CollectOperator
+ 
++_alignment_setup = Path(os.environ.get("DAGGER_ROOT", Path(__file__).resolve().parents[1])) / "setup"
++sys.path.insert(0, str(_alignment_setup))
++from master_alignment_feedback import alignment_targets, wait_for_master_alignment
++from follower_readiness import check_followers_ready
++from teaching_readiness import require_pair_ready
++
+ CAMERA_NAMES = ["cam_high", "cam_right_wrist", "cam_left_wrist"]
+ 
+ observation_window = None
+ # smoothing globals
+ stream_buffer = None
++inference_generation = 0
++inference_state_lock = threading.Lock()
+ 
+ # DAgger mode control
+ dagger_mode_active = False
++resume_inference_requested = False
++resume_inference_in_progress = False
+ dagger_mode_lock = threading.Lock()
+ 
+ save_data_requested = False
+@@ -235,8 +246,9 @@
+             
+             print("\n" + "="*70)
+             print("Save done. Collection ended.")
++            print("Follower forwarding stays paused while this recording is stopped.")
+             print("Press 'r' to exit DAgger and resume inference.")
+-            print("Or press 'd' + Space to start a new collection.")
++            print("Or press Space / the left pedal to resume following and start a new recording.")
+             print("="*70 + "\n")
+             return True
+         except Exception as e:
+@@ -252,96 +264,190 @@
+         return len(self.actions) > 0
+ 
+ 
+-def keyboard_monitor_thread():
+-    """Monitor keyboard input for Ctrl+Q to activate DAgger mode and 'r' to resume"""
+-    global dagger_mode_active, save_data_requested, collection_active
+-    global delete_data_requested, waiting_for_user_confirm
++def handle_operator_action(char, source="keyboard", ros_operator=None):
++    """Dispatch keyboard and private pedal actions through the same controls."""
++    global dagger_mode_active, resume_inference_requested, save_data_requested, collection_active
++    global delete_data_requested, waiting_for_user_confirm, resume_inference_in_progress
++    if source == 'pedal':
++        if char not in ('left', 'save', 'resume', 'delete'):
++            return
++        pedal = char
++        char = {'left': 'd', 'save': 's', 'resume': 'r', 'delete': 'w'}[pedal]
++        with delete_data_lock:
++            if waiting_for_user_confirm:
++                waiting_for_user_confirm = False
++                if pedal == 'delete':
++                    delete_data_requested = True
++                    print("\nDelete requested. Deleting data...\n")
++                else:
++                    print("\nData confirmed.\n")
++                return
++        if pedal == 'delete':
++            return
++        if pedal == 'left' and dagger_mode_active:
++            if collection_active:
++                print("\nDAgger recording is already requested.\n")
++                return
++            if ros_operator is None or not ros_operator.dagger_recording_status()[0]:
++                print("\nTeaching mode is not confirmed; pedal did not request a new recording.\n")
++                return
++            char = ' '
++    if not char:
++        return
++    with delete_data_lock:
++        is_waiting_confirm = waiting_for_user_confirm
++    if is_waiting_confirm:
++        if char.lower() == 'w':
++            with delete_data_lock:
++                delete_data_requested = True
++                waiting_for_user_confirm = False
++                print("\nDelete requested. Deleting data...\n")
++        else:
++            with delete_data_lock:
++                waiting_for_user_confirm = False
++            print("\nData confirmed.\n")
++        return
+     
+-    # Save terminal settings
++    # Check for Ctrl+Q (ASCII 17)
++    if ord(char) == 17:
++        with dagger_mode_lock:
++            if not dagger_mode_active:
++                dagger_mode_active = True
++                print("\n" + "🎯"*35)
++                print("🎯 DAgger mode ACTIVATED! Pausing inference...")
++                print("🎯"*35 + "\n")
++            else:
++                print("\n⚠️ DAgger mode already active\n")
++    
++    # 'd' key to activate DAgger mode
++    elif char.lower() == 'd':
++        with dagger_mode_lock:
++            if not dagger_mode_active:
++                dagger_mode_active = True
++                print("\n" + "🎯"*35)
++                print("🎯 DAgger mode ACTIVATED! Pausing inference...")
++                print("🎯"*35 + "\n")
++            else:
++                print("\n⚠️ DAgger mode already active\n")
++    
++    # 'r' key to resume inference mode
++    elif char.lower() == 'r':
++        # Do not queue an old key behind a long mode transition and
++        # accidentally turn it into a retry after that attempt ends.
++        if not dagger_mode_lock.acquire(False):
++            return
++        try:
++            if dagger_mode_active and not resume_inference_requested and not resume_inference_in_progress:
++                resume_inference_requested = True
++                print("\n" + "▶️"*35)
++                print("▶️ Policy resume requested; waiting for master handoff...")
++                print("▶️"*35 + "\n")
++            elif not dagger_mode_active:
++                print("\n⚠️ Already in inference mode\n")
++        finally:
++            dagger_mode_lock.release()
++    
++    elif char.lower() == 's':
++        with dagger_mode_lock:
++            if dagger_mode_active:
++                with save_data_lock:
++                    save_data_requested = True
++                print("\n" + "💾"*35)
++                print("💾 Save requested - will save at next opportunity...")
++                print("💾"*35 + "\n")
++            else:
++                print("\n⚠️ Not in DAgger mode, cannot save data\n")
++    
++    elif char == ' ':
++        with dagger_mode_lock:
++            if dagger_mode_active:
++                if resume_inference_requested or resume_inference_in_progress:
++                    print("\nMaster handoff is in progress; current correction data is kept.\n")
++                    return
++                with collection_lock:
++                    if not collection_active:
++                        collection_active = True
++                        print("\nRecording requested; waiting for teaching status if needed.\n")
++                    else:
++                        print("\nRecording is already requested; current data is kept.\n")
++            else:
++                print("\nEnter DAgger mode first (press 'd').\n")
++
++
++def _pedal_pipe_from_environment(name):
++    """Adopt only an explicitly inherited private pipe, never stdin/stdout."""
++    import stat
++    value = os.environ.get(name)
++    if value is None:
++        return None
++    try:
++        descriptor = int(value)
++        if descriptor < 3 or not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
++            raise ValueError('expected a private inherited pipe')
++        os.set_inheritable(descriptor, False)
++        return descriptor
++    except (ValueError, OSError):
++        print("\nPedal pipe is unavailable; keyboard controls remain available.\n")
++        return None
++
++
++def keyboard_monitor_thread(ros_operator=None):
++    """Select keyboard input and optional private newline pedal commands."""
+     old_settings = termios.tcgetattr(sys.stdin)
+-    
++    command_fd = _pedal_pipe_from_environment('DAGGER_PEDAL_COMMAND_FD')
++    ready_fd = _pedal_pipe_from_environment('DAGGER_PEDAL_READY_FD')
++    owned_fds = {fd for fd in (command_fd, ready_fd) if fd is not None}
++    pending = b''
++    tokens = {b'left': 'left', b'save': 'save', b'resume': 'resume', b'delete': 'delete'}
+     try:
+         tty.setcbreak(sys.stdin.fileno())
+-        
++        # Commands queued before keyboard readiness must not execute later.
++        if command_fd is not None:
++            while select.select([command_fd], [], [], 0)[0]:
++                if not os.read(command_fd, 4096):
++                    os.close(command_fd)
++                    owned_fds.discard(command_fd)
++                    command_fd = None
++                    break
++        if ready_fd is not None:
++            try:
++                if command_fd is not None:
++                    os.write(ready_fd, b'ready\n')
++            except OSError:
++                pass
++            finally:
++                os.close(ready_fd)
++                owned_fds.discard(ready_fd)
+         while not rospy.is_shutdown():
+-            if select.select([sys.stdin], [], [], 0.1)[0]:
+-                char = sys.stdin.read(1)
+-                
+-                with delete_data_lock:
+-                    is_waiting_confirm = waiting_for_user_confirm
+-                if is_waiting_confirm:
+-                    if char.lower() == 'w':
+-                        with delete_data_lock:
+-                            delete_data_requested = True
+-                            waiting_for_user_confirm = False
+-                            print("\nDelete requested. Deleting data...\n")
+-                    else:
+-                        with delete_data_lock:
+-                            waiting_for_user_confirm = False
+-                        print("\nData confirmed.\n")
+-                    continue
+-                
+-                # Check for Ctrl+Q (ASCII 17)
+-                if ord(char) == 17:
+-                    with dagger_mode_lock:
+-                        if not dagger_mode_active:
+-                            dagger_mode_active = True
+-                            print("\n" + "🎯"*35)
+-                            print("🎯 DAgger mode ACTIVATED! Pausing inference...")
+-                            print("🎯"*35 + "\n")
+-                        else:
+-                            print("\n⚠️ DAgger mode already active\n")
+-                
+-                # 'd' key to activate DAgger mode
+-                elif char.lower() == 'd':
+-                    with dagger_mode_lock:
+-                        if not dagger_mode_active:
+-                            dagger_mode_active = True
+-                            print("\n" + "🎯"*35)
+-                            print("🎯 DAgger mode ACTIVATED! Pausing inference...")
+-                            print("🎯"*35 + "\n")
+-                        else:
+-                            print("\n⚠️ DAgger mode already active\n")
+-                
+-                # 'r' key to resume inference mode
+-                elif char.lower() == 'r':
+-                    with dagger_mode_lock:
+-                        if dagger_mode_active:
+-                            dagger_mode_active = False
+-                            print("\n" + "▶️"*35)
+-                            print("▶️ Resuming inference mode...")
+-                            print("▶️"*35 + "\n")
+-                        else:
+-                            print("\n⚠️ Already in inference mode\n")
+-                
+-                elif char.lower() == 's':
+-                    with dagger_mode_lock:
+-                        if dagger_mode_active:
+-                            with save_data_lock:
+-                                save_data_requested = True
+-                            print("\n" + "💾"*35)
+-                            print("💾 Save requested - will save at next opportunity...")
+-                            print("💾"*35 + "\n")
+-                        else:
+-                            print("\n⚠️ Not in DAgger mode, cannot save data\n")
+-                
+-                elif char == ' ':
+-                    with dagger_mode_lock:
+-                        if dagger_mode_active:
+-                            with collection_lock:
+-                                if not collection_active:
+-                                    print("\nStarting data collection...\n")
+-                                    collection_active = True
+-                                    print("\n" + "="*70)
+-                                    print("Data collection started.")
+-                                    print("="*70 + "\n")
+-                                else:
+-                                    print("\nAlready collecting.\n")
+-                        else:
+-                            print("\nEnter DAgger mode first (press 'd').\n")
+-                            
++            inputs = [sys.stdin] + ([command_fd] if command_fd is not None else [])
++            for ready in select.select(inputs, [], [], 0.1)[0]:
++                if command_fd is not None and ready == command_fd:
++                    try:
++                        data = os.read(command_fd, 4096)
++                    except OSError:
++                        data = b''
++                    if not data:
++                        os.close(command_fd)
++                        owned_fds.discard(command_fd)
++                        command_fd = None
++                        pending = b''
++                        continue
++                    pending += data
++                    while b'\n' in pending:
++                        line, pending = pending.split(b'\n', 1)
++                        action = tokens.get(line)
++                        if action is not None:
++                            handle_operator_action(action, source='pedal', ros_operator=ros_operator)
++                    if len(pending) > 4096:
++                        os.close(command_fd)
++                        owned_fds.discard(command_fd)
++                        command_fd = None
++                        pending = b''
++                else:
++                    handle_operator_action(sys.stdin.read(1), source='keyboard', ros_operator=ros_operator)
+     finally:
+-        # Restore terminal settings
++        for descriptor in owned_fds:
++            os.close(descriptor)
+         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+ 
+ 
+@@ -416,6 +522,20 @@
+             self.k += 1
+             return act
+ 
++def reset_inference_after_intervention():
++    """Discard queued/inflight policy actions from before the correction."""
++    global inference_generation, observation_window
++    with inference_state_lock:
++        inference_generation += 1
++        observation_window = None
++        if stream_buffer is not None:
++            with stream_buffer.lock:
++                stream_buffer.cur_chunk.clear()
++                stream_buffer.chunks.clear()
++                stream_buffer.last_action = None
++                stream_buffer.k = 0
++
++
+ def start_inference_thread(args, config, policy, ros_operator):
+     th = threading.Thread(target=inference_fn_non_blocking_fast, args=(args, config, policy, ros_operator))
+     th.daemon = True
+@@ -434,6 +554,7 @@
+                     time.sleep(0.01)
+                 continue
+             # Update observation
++            generation = inference_generation
+             update_observation_window(args, config, ros_operator)
+             latest_obs = observation_window[-1]
+             imgs = [
+@@ -457,7 +578,9 @@
+             if actions is not None and len(actions) > 0:
+                 max_k = int(getattr(args, "latency_k", 0))
+                 min_m = int(getattr(args, "min_smooth_steps", 8))
+-                stream_buffer.integrate_new_chunk(actions, max_k=max_k, min_m=min_m)
++                with inference_state_lock:
++                    if not dagger_mode_active and generation == inference_generation:
++                        stream_buffer.integrate_new_chunk(actions, max_k=max_k, min_m=min_m)
+             try:
+                 rate.sleep()
+             except Exception:
+@@ -666,8 +789,10 @@
+ def model_inference(args, config, ros_operator, keyboard_thread_started=False):
+     global lang_embeddings
+     global dagger_mode_active
++    global resume_inference_requested
+     global save_data_requested
+     global collection_active
++    global resume_inference_in_progress
+ 
+     # Load client
+     policy = websocket_client_policy.WebsocketClientPolicy(
+@@ -683,13 +808,14 @@
+     # Initialize position of the puppet arm
+     left0 = [0, 0.32, -0.36, 0, 0.24, 0, 0.07]
+     right0 = [0, 0.32, -0.36, 0, 0.24, 0, 0.07]
++    ros_operator.wait_for_fresh_policy_inputs()
+     ros_operator.puppet_arm_publish_continuous(left0, right0)
+     # input("Press enter to continue")
+     # ros_operator.puppet_arm_publish_continuous(left0, right0)
+     
+     # Start keyboard monitor thread AFTER input() to avoid terminal conflicts
+     if not keyboard_thread_started:
+-        keyboard_thread = threading.Thread(target=keyboard_monitor_thread, daemon=True)
++        keyboard_thread = threading.Thread(target=keyboard_monitor_thread, args=(ros_operator,), daemon=True)
+         keyboard_thread.start()
+         print("\n" + "="*70)
+         print("✅ Keyboard monitor thread started")
+@@ -717,27 +843,63 @@
+             last_stream_act = None
+ 
+             while t < max_publish_step and not rospy.is_shutdown():
++                resume_now = False
+                 # Check if DAgger mode is activated
+                 with dagger_mode_lock:
+                     if dagger_mode_active and not dagger_mode_entered:
+                         print("\n" + "="*70)
+                         print("⏸️  INFERENCE PAUSED - ENTERING DAGGER MODE")
+                         print("="*70 + "\n")
+-                        ros_operator.enter_dagger_mode()
++                        if not ros_operator.enter_dagger_mode():
++                            raise RuntimeError("Failed to enter DAgger mode; inference remains stopped")
++                        with collection_lock:
++                            ros_operator.data_collector.start_collection()
++                            ros_operator.consume_dagger_preroll()
++                            collection_active = True
+                         dagger_mode_entered = True
+-                    elif not dagger_mode_active and dagger_mode_entered:
++                    elif resume_inference_requested and dagger_mode_entered:
++                        resume_inference_requested = False
++                        resume_inference_in_progress = True
++                        resume_now = True
++
++                # Keep the keyboard lock free while observing the FC handoff.
++                # Repeated r keys are consumed as part of this one attempt.
++                if resume_now:
++                    try:
++                        # Stop data collection
++                        ros_operator.data_collector.stop_collection()
++                        with collection_lock:
++                            collection_active = False
++                        ros_operator.exit_dagger_mode()
++                    except Exception as exc:
++                        print("\nMaster handoff is incomplete; DAgger and policy pause are kept.")
++                        print(str(exc))
++                        print("Current correction data is kept. Press 'r' to retry, 's' to save, or Ctrl+C to stop.\n")
++                    else:
++                        reset_inference_after_intervention()
++                        last_stream_act = None
++                        pre_action = None
++                        t = 0
++                        action_buffer = np.zeros([chunk_size, config["state_dim"]])
++                        kalman_filters = [SimpleKalmanFilter() for _ in range(config["state_dim"])]
++                        ros_operator.start_inference_collection()
++                        with dagger_mode_lock:
++                            dagger_mode_active = False
++                            dagger_mode_entered = False
+                         print("\n" + "="*70)
+                         print("▶️  DAGGER MODE DEACTIVATED - RESUMING INFERENCE")
+                         print("="*70 + "\n")
+-                        
+-                        # Stop data collection
+-                        ros_operator.data_collector.stop_collection()
+-                        
+-                        dagger_mode_entered = False
++                    finally:
++                        with dagger_mode_lock:
++                            resume_inference_in_progress = False
+                 
+                 # Check save request
+                 with save_data_lock:
+                     if save_data_requested and dagger_mode_active:
++                        ros_operator.set_dagger_following(False)
++                        ros_operator.data_collector.stop_collection()
++                        with collection_lock:
++                            collection_active = False
+                         if ros_operator.data_collector.has_data():
+                             ros_operator.data_collector.save_current_episode(
+                                 export_video=getattr(args, 'export_video', True),
+@@ -745,50 +907,36 @@
+                                 video_codec=getattr(args, 'video_codec', 'libx264'),
+                                 video_quality=getattr(args, 'video_quality', 23)
+                             )
+-                            # Stop after save
+-                            with collection_lock:
+-                                collection_active = False
+                         else:
+                             print("\nNo data to save.\n")
+                         save_data_requested = False
+                 
+-                # Check if starting collection
++                # Mode/enable confirmation controls data quality only. A quiet
++                # native command stream is legal while the master is stationary.
++                recording_ready = not dagger_mode_active or ros_operator.dagger_recording_ready()
++
++                # A pending Space request must not repeatedly reset an episode
++                # while mode confirmation is unavailable.
+                 with collection_lock:
+-                    if collection_active and not ros_operator.data_collector.is_collecting:
+-                        ros_operator.data_collector.start_collection()
++                    if recording_ready and collection_active and not ros_operator.data_collector.is_collecting:
++                        if ros_operator.data_collector.has_data():
++                            collection_active = False
++                            print("\nUnsaved correction data is kept. Press 's' before starting a new recording.\n")
++                        else:
++                            ros_operator.set_dagger_following(True)
++                            ros_operator.data_collector.start_collection()
+     
+                 # If in DAgger mode, skip inference and collect demonstration data
+                 if dagger_mode_active:
++                    if not recording_ready:
++                        rate.sleep()
++                        continue
+                     # Collect using time-synced get_synced_frame
+                     synced_data = ros_operator.get_synced_frame()
+                     
+                     if synced_data is not None:
+                         try:
+-                            # Unpack synced data
+-                            (front_img, left_img, right_img, 
+-                             puppet_left, puppet_right, 
+-                             master_left, master_right) = synced_data
+-                            
+-                            # Build observation (same as collect_data)
+-                            camera_names = ['cam_high', 'cam_left_wrist', 'cam_right_wrist']
+-                            image_dict = {
+-                                camera_names[0]: front_img,   # cam_high
+-                                camera_names[1]: left_img,    # cam_left_wrist
+-                                camera_names[2]: right_img    # cam_right_wrist
+-                            }
+-                            observation = collections.OrderedDict()
+-                            observation['images'] = image_dict
+-                            observation['qpos'] = np.concatenate((puppet_left.position, puppet_right.position))
+-                            observation['qvel'] = np.concatenate((puppet_left.velocity, puppet_right.velocity))
+-                            observation['effort'] = np.concatenate((puppet_left.effort, puppet_right.effort))
+-                            observation['base_vel'] = [0.0, 0.0]
+-                            
+-                            # Build action (same as collect_data): slave 6 joints + master gripper
+-                            left_action = puppet_left.position[:7]
+-                            right_action = puppet_right.position[:7]
+-                            action = np.concatenate((left_action, right_action))
+-                            
+-                            # Add to collector
++                            observation, action = ros_operator._build_dagger_sample(synced_data)
+                             ros_operator.data_collector.add_frame(observation, action)
+                         except Exception as e:
+                             print(f"Collection error: {e}")
+@@ -843,6 +991,8 @@
+                 if t % chunk_size == 0:
+                     # Start inference
+                     action_buffer = inference_fn(args, config, policy).copy()
++                if dagger_mode_active:
++                    continue
+ 
+                 raw_action = action_buffer[t % chunk_size]
+ 
+@@ -853,6 +1003,8 @@
+                     action = raw_action
+                 # Interpolate the original action sequence
+                 if args.use_actions_interpolation:
++                    if pre_action is None:
++                        pre_action = observation_window[-1]["qpos"].copy()
+                     # print(f"Time {t}, pre {pre_action}, act {action}")
+                     if args.interpolate_method == "linear":
+                         interp_actions = interpolate_action(args, pre_action, action)
+@@ -918,6 +1070,16 @@
+         self.puppet_arm_publish_lock = None
+         self.args = args
+         self.stop_flag = False
++        self.master_handoff_lock = threading.Lock()
++        self.master_control_feedback = {}
++        self.master_prepared_feedback = {}
++        self.master_command_seen_at = {}
++        self.follower_ready_feedback = {}
++        self._dagger_preroll = None
++        self._pending_dagger_preroll = []
++        self._dagger_live_after_source_time = None
++        self.policy_input_lock = threading.Lock()
++        self.policy_input_stamps = {}
+         # DAgger mode - master arm control
+         self.master_arm_left_deque = None
+         self.master_arm_right_deque = None
+@@ -938,7 +1100,7 @@
+         dataset_base = getattr(self.args, "dataset_name", "flat_1107_27_35_mixed1.0")
+         dataset_base = dataset_base.replace("_dagger_hdf5", "").replace("_inference_hdf5", "")
+ 
+-        base_data_dir = "/home/agilex/data"
++        base_data_dir = getattr(self.args, "dataset_dir", "/home/agilex/data")
+         # DAgger data dir
+         dagger_dir = os.path.join(base_data_dir, f"{dataset_base}_dagger_hdf5", "aloha_mobile_dummy")
+         os.makedirs(dagger_dir, exist_ok=True)
+@@ -1110,16 +1272,38 @@
+         self.master_arm_left_deque = deque()
+         self.master_arm_right_deque = deque()
+ 
+-    def keyboard_listener(self):
+-        def on_press(key):
+-            if key == keyboard.Key.space:
+-                self.stop_flag = True
+-                print("\033[35m>>> Space pressed, stopping and saving...\033[0m")
+-                return False
+-        with keyboard.Listener(on_press=on_press) as listener:
+-            listener.join()
+-
+-    def puppet_arm_publish(self, left, right):
++    def record_policy_input_stamp(self, name, msg):
++        with self.policy_input_lock:
++            self.policy_input_stamps[name] = msg.header.stamp.to_sec()
++
++    def require_fresh_policy_inputs(self):
++        now = rospy.Time.now().to_sec()
++        with self.policy_input_lock:
++            stamps = dict(self.policy_input_stamps)
++        for name, max_age in [('camera_front', 0.5), ('camera_left', 0.5), ('camera_right', 0.5),
++                              ('follower_left', 0.25), ('follower_right', 0.25)]:
++            stamp = stamps.get(name)
++            if stamp is None or not math.isfinite(now) or not math.isfinite(stamp):
++                raise RuntimeError("Missing/nonfinite policy input: " + name)
++            age = now - stamp
++            if not math.isfinite(age) or not -0.05 <= age <= max_age:
++                raise RuntimeError("Stale/future policy input: %s (age %.3fs)" % (name, age))
++
++    def wait_for_fresh_policy_inputs(self, timeout=15.0):
++        deadline = time.monotonic() + timeout
++        last_error = "No policy input received"
++        while not rospy.is_shutdown() and time.monotonic() < deadline:
++            try:
++                self.require_fresh_policy_inputs()
++                return
++            except RuntimeError as exc:
++                last_error = str(exc)
++            time.sleep(0.02)
++        raise RuntimeError("Policy startup requires fresh three-camera/two-follower input: " + last_error)
++
++    def puppet_arm_publish(self, left, right, *, require_policy_inputs=True):
++        if require_policy_inputs:
++            self.require_fresh_policy_inputs()
+         joint_state_msg = JointState()
+         joint_state_msg.header = Header()
+         joint_state_msg.header.stamp = rospy.Time.now()  # Set timestep
+@@ -1138,6 +1322,7 @@
+         self.puppet_arm_right_publisher.publish(joint_state_msg)
+ 
+     def endpose_publish(self, left, right):
++        self.require_fresh_policy_inputs()
+         endpose_msg = PosCmd()
+         endpose_msg.x, endpose_msg.y, endpose_msg.z = left[:3]
+         endpose_msg.roll, endpose_msg.pitch, endpose_msg.yaw = left[3:6]
+@@ -1150,6 +1335,7 @@
+         self.endpose_right_publisher.publish(endpose_msg)
+ 
+     def robot_base_publish(self, vel):
++        self.require_fresh_policy_inputs()
+         vel_msg = Twist()
+         vel_msg.linear.x = vel[0]
+         vel_msg.linear.y = 0
+@@ -1195,6 +1381,7 @@
+                 else:
+                     right_arm[i] += right_symbol[i] * self.args.arm_steps_length[i]
+                     flag = True
++            self.require_fresh_policy_inputs()
+             joint_state_msg = JointState()
+             joint_state_msg.header = Header()
+             joint_state_msg.header.stamp = rospy.Time.now()  # Set the timestep
+@@ -1332,15 +1519,15 @@
+ 
+         while self.img_left_deque[0].header.stamp.to_sec() < frame_time:
+             self.img_left_deque.popleft()
+-        img_left = self.bridge.imgmsg_to_cv2(self.img_left_deque.popleft(), "passthrough")
++        img_left = self.bridge.imgmsg_to_cv2(self.img_left_deque.popleft(), "bgr8")
+ 
+         while self.img_right_deque[0].header.stamp.to_sec() < frame_time:
+             self.img_right_deque.popleft()
+-        img_right = self.bridge.imgmsg_to_cv2(self.img_right_deque.popleft(), "passthrough")
++        img_right = self.bridge.imgmsg_to_cv2(self.img_right_deque.popleft(), "bgr8")
+ 
+         while self.img_front_deque[0].header.stamp.to_sec() < frame_time:
+             self.img_front_deque.popleft()
+-        img_front = self.bridge.imgmsg_to_cv2(self.img_front_deque.popleft(), "passthrough")
++        img_front = self.bridge.imgmsg_to_cv2(self.img_front_deque.popleft(), "bgr8")
+ 
+         while self.puppet_arm_left_deque[0].header.stamp.to_sec() < frame_time:
+             self.puppet_arm_left_deque.popleft()
+@@ -1453,9 +1640,9 @@
+         puppet_arm_left = first_ge(self.puppet_arm_left_deque, frame_time)
+         puppet_arm_right = first_ge(self.puppet_arm_right_deque, frame_time)
+ 
+-        img_left = self.bridge.imgmsg_to_cv2(img_left_msg, "passthrough")
+-        img_right = self.bridge.imgmsg_to_cv2(img_right_msg, "passthrough")
+-        img_front = self.bridge.imgmsg_to_cv2(img_front_msg, "passthrough")
++        img_left = self.bridge.imgmsg_to_cv2(img_left_msg, "bgr8")
++        img_right = self.bridge.imgmsg_to_cv2(img_right_msg, "bgr8")
++        img_front = self.bridge.imgmsg_to_cv2(img_front_msg, "bgr8")
+ 
+         img_left_depth = None
+         img_right_depth = None
+@@ -1482,16 +1669,19 @@
+         )
+ 
+     def img_left_callback(self, msg):
++        self.record_policy_input_stamp('camera_left', msg)
+         if len(self.img_left_deque) >= 2000:
+             self.img_left_deque.popleft()
+         self.img_left_deque.append(msg)
+ 
+     def img_right_callback(self, msg):
++        self.record_policy_input_stamp('camera_right', msg)
+         if len(self.img_right_deque) >= 2000:
+             self.img_right_deque.popleft()
+         self.img_right_deque.append(msg)
+ 
+     def img_front_callback(self, msg):
++        self.record_policy_input_stamp('camera_front', msg)
+         if len(self.img_front_deque) >= 2000:
+             self.img_front_deque.popleft()
+         self.img_front_deque.append(msg)
+@@ -1512,11 +1702,13 @@
+         self.img_front_depth_deque.append(msg)
+ 
+     def puppet_arm_left_callback(self, msg):
++        self.record_policy_input_stamp('follower_left', msg)
+         if len(self.puppet_arm_left_deque) >= 2000:
+             self.puppet_arm_left_deque.popleft()
+         self.puppet_arm_left_deque.append(msg)
+ 
+     def puppet_arm_right_callback(self, msg):
++        self.record_policy_input_stamp('follower_right', msg)
+         if len(self.puppet_arm_right_deque) >= 2000:
+             self.puppet_arm_right_deque.popleft()
+         self.puppet_arm_right_deque.append(msg)
+@@ -1557,10 +1749,12 @@
+             self.img_right_deque[-1].header.stamp.to_sec(),
+             self.img_front_deque[-1].header.stamp.to_sec()
+         ])
++        if (self._dagger_live_after_source_time is not None
++                and frame_time <= self._dagger_live_after_source_time):
++            return None
+         
+         # Check all data has reached this time
+         for dq in [self.img_left_deque, self.img_right_deque, self.img_front_deque,
+-                   self.master_arm_left_deque, self.master_arm_right_deque,
+                    self.puppet_arm_left_deque, self.puppet_arm_right_deque]:
+             if not dq or dq[-1].header.stamp.to_sec() < frame_time:
+                 return None
+@@ -1574,11 +1768,14 @@
+         
+         try:
+             # Get data in original order
+-            img_left = self.bridge.imgmsg_to_cv2(pop(self.img_left_deque), 'passthrough')
+-            img_right = self.bridge.imgmsg_to_cv2(pop(self.img_right_deque), 'passthrough')
+-            img_front = self.bridge.imgmsg_to_cv2(pop(self.img_front_deque), 'passthrough')
+-            master_arm_left = pop(self.master_arm_left_deque)
+-            master_arm_right = pop(self.master_arm_right_deque)
++            img_left = self.bridge.imgmsg_to_cv2(pop(self.img_left_deque), 'bgr8')
++            img_right = self.bridge.imgmsg_to_cv2(pop(self.img_right_deque), 'bgr8')
++            img_front = self.bridge.imgmsg_to_cv2(pop(self.img_front_deque), 'bgr8')
++            # These master observations are diagnostic only. DAgger qpos/action
++            # use actual follower states, so a legal idle master must not block
++            # camera/follower synchronization or receive an invented timestamp.
++            master_arm_left = self.master_arm_left_deque[-1] if self.master_arm_left_deque else None
++            master_arm_right = self.master_arm_right_deque[-1] if self.master_arm_right_deque else None
+             puppet_arm_left = pop(self.puppet_arm_left_deque)
+             puppet_arm_right = pop(self.puppet_arm_right_deque)
+             
+@@ -1588,7 +1785,202 @@
+         except Exception as e:
+             print(f"get_synced_frame error: {e}")
+             return None
++
++    def _build_dagger_sample(self, synced_data):
++        """Use the same actual-follower observation/action schema for both paths."""
++        front_img, left_img, right_img, puppet_left, puppet_right, _, _ = synced_data
++        observation = collections.OrderedDict()
++        observation['images'] = {
++            'cam_high': front_img,
++            'cam_left_wrist': left_img,
++            'cam_right_wrist': right_img,
++        }
++        observation['qpos'] = np.concatenate((puppet_left.position, puppet_right.position))
++        observation['qvel'] = np.concatenate((puppet_left.velocity, puppet_right.velocity))
++        observation['effort'] = np.concatenate((puppet_left.effort, puppet_right.effort))
++        observation['base_vel'] = [0.0, 0.0]
++        action = np.concatenate((puppet_left.position[:7], puppet_right.position[:7]))
++        return observation, action
++
++    def _snapshot_dagger_sample(self):
++        """Sample five synchronized streams without consuming the control deques."""
++        streams = tuple(tuple(stream) for stream in (
++            self.img_left_deque, self.img_right_deque, self.img_front_deque,
++            self.puppet_arm_left_deque, self.puppet_arm_right_deque))
++        if not all(streams):
++            return None
++        source_time = min(stream[-1].header.stamp.to_sec() for stream in streams[:3])
++        if any(stream[-1].header.stamp.to_sec() < source_time for stream in streams):
++            return None
++        messages = [next(message for message in stream
++                         if message.header.stamp.to_sec() >= source_time)
++                    for stream in streams]
++        left_img, right_img, front_img = (
++            self.bridge.imgmsg_to_cv2(message, 'bgr8') for message in messages[:3])
++        observation, action = self._build_dagger_sample(
++            (front_img, left_img, right_img, messages[3], messages[4], None, None))
++        return source_time, observation, action
++
++    def start_dagger_preroll(self):
++        """Keep only one second of real samples while the original entry runs."""
++        self._pending_dagger_preroll = []
++        self._dagger_live_after_source_time = None
++        state = {'stop': threading.Event(), 'samples': deque()}
++        self._dagger_preroll = state
++
++        def sample():
++            last_source_time = None
++            while not state['stop'].is_set() and not rospy.is_shutdown():
++                try:
++                    frame = self._snapshot_dagger_sample()
++                    if frame is not None:
++                        source_time, observation, action = frame
++                        if last_source_time is None or source_time > last_source_time:
++                            sampled_at = time.monotonic()
++                            state['samples'].append((sampled_at, source_time, observation, action))
++                            last_source_time = source_time
++                            while state['samples'][0][1] < source_time - 1.0:
++                                state['samples'].popleft()
++                except Exception as exc:
++                    print(f"DAgger pre-roll sample error: {exc}")
++                state['stop'].wait(1.0 / self.args.publish_rate)
++
++        state['thread'] = threading.Thread(target=sample, daemon=False)
++        state['thread'].start()
++
++    def finish_dagger_preroll(self, ready_at=None):
++        """End this data-only worker and retain the second before normal readiness."""
++        state = self._dagger_preroll
++        state['stop'].set()
++        state['thread'].join()
++        self._dagger_preroll = None
++        self._pending_dagger_preroll = ([] if ready_at is None or rospy.is_shutdown() else [
++            sample for sample in state['samples'] if ready_at - 1.0 <= sample[1] <= ready_at])
++
++    def consume_dagger_preroll(self):
++        """Append the entry prefix once, after start_collection has reset the episode."""
++        samples = self._pending_dagger_preroll
++        self._pending_dagger_preroll = []
++        for _, source_time, observation, action in samples:
++            self.data_collector.add_frame(observation, action)
++            self._dagger_live_after_source_time = source_time
+     
++    def master_control_status_callback(self, msg, side):
++        with self.master_handoff_lock:
++            received = time.monotonic()
++            self.master_control_feedback[side] = (received, msg.angular.y, msg.linear.z)
++            self.master_prepared_feedback[side] = {
++                'received_monotonic': received, 'source_time': msg.angular.x,
++                'phase_since': msg.angular.z, 'config': msg.angular.y,
++                'teaching': msg.linear.z, 'enabled': msg.linear.y}
++
++    def master_command_callback(self, msg, side):
++        with self.master_handoff_lock:
++            self.master_command_seen_at[side] = time.monotonic()
++
++    def follower_ready_callback(self, msg, side):
++        with self.master_handoff_lock:
++            self.follower_ready_feedback[side] = {
++                'received_monotonic': time.monotonic(), 'source_time': msg.angular.x,
++                'ready': msg.linear.x == 1.0, 'command_time': msg.linear.y}
++
++    def wait_for_master_control(self, config, teaching, since, timeout=15.0, quiet_period=0.0):
++        deadline = None if timeout is None else time.monotonic() + timeout
++        while not rospy.is_shutdown() and (deadline is None or time.monotonic() < deadline):
++            now = time.monotonic()
++            with self.master_handoff_lock:
++                ready = all(
++                    side in self.master_control_feedback
++                    and self.master_control_feedback[side][0] >= since
++                    and -0.05 <= now - self.master_control_feedback[side][0] < 0.5
++                    and self.master_control_feedback[side][1:] == (config, int(teaching))
++                    for side in ('left', 'right')
++                )
++                quiet = all(now - max(since, self.master_command_seen_at.get(side, since)) >= quiet_period
++                            for side in ('left', 'right'))
++                streaming = not teaching or all(
++                    side in self.master_command_seen_at
++                    and self.master_command_seen_at[side] >= since
++                    and self.master_command_seen_at[side] <= now + 0.05
++                    for side in ('left', 'right')
++                )
++            if ready and quiet and streaming:
++                if not teaching or self.dagger_recording_status()[0]:
++                    return
++            time.sleep(0.02)
++        raise RuntimeError("Master handoff incomplete: " + self._master_handoff_diagnostics(
++            config, teaching, since, quiet_period) + "; policy stays paused")
++
++    def _master_handoff_diagnostics(self, config, teaching, since, quiet_period):
++        now = time.monotonic()
++        with self.master_handoff_lock:
++            modes = dict(self.master_control_feedback)
++            metadata = dict(getattr(self, 'master_prepared_feedback', {}))
++            commands = dict(self.master_command_seen_at)
++        details = ["expected mode=0x%02X teaching=%d" % (config, teaching)]
++        for side in ('left', 'right'):
++            row = modes.get(side)
++            if row is None:
++                state = 'mode=missing'
++            else:
++                state = 'mode=0x%02X teaching=%s enabled=%s status_age=%.3fs after_request=%s' % (
++                    int(row[1]), row[2], metadata.get(side, {}).get('enabled', 'unknown'),
++                    now - row[0], row[0] >= since)
++            if teaching:
++                command_state = 'post_request_command=%s' % (commands.get(side, -1) >= since)
++            else:
++                quiet_for = now - max(since, commands.get(side, since))
++                command_state = 'publisher=%s quiet_for=%.3fs required=%.3fs' % (
++                    'quiet' if quiet_for >= quiet_period else 'still-publishing', quiet_for, quiet_period)
++            details.append(side + '[' + state + '; ' + command_state + ']')
++        return '; '.join(details)
++
++    def dagger_recording_status(self):
++        """Read confirmed teaching mode; never infer a motion fault from silence."""
++        now, wall_now = time.monotonic(), time.time()
++        with self.master_handoff_lock:
++            rows = {side: dict(row) for side, row in self.master_prepared_feedback.items()}
++            commands = dict(self.master_command_seen_at)
++        for side in ('left', 'right'):
++            row = rows.get(side)
++            if row is None:
++                return False, side + ' master mode confirmation is missing'
++            values = [row.get(key) for key in ('received_monotonic', 'source_time', 'config', 'teaching', 'enabled')]
++            if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in values):
++                return False, side + ' master mode confirmation is invalid'
++            if (not -0.05 <= now - row['received_monotonic'] < 0.5
++                    or not -0.05 <= wall_now - row['source_time'] < 0.5):
++                return False, side + ' master mode confirmation is temporarily unavailable'
++            if row['config'] != 0xFA or row['teaching'] != 1 or row['enabled'] != 1:
++                return False, side + ' master teaching/following mode is not confirmed'
++        if any(side not in commands or now - commands[side] >= 0.5 for side in ('left', 'right')):
++            return True, 'Waiting for new master input; stationary follower states may still be recorded'
++        return True, 'Teaching/following mode confirmed'
++
++    def dagger_recording_ready(self):
++        ready, reason = self.dagger_recording_status()
++        notice = (ready, reason)
++        if notice != getattr(self, '_dagger_recording_notice', None):
++            prefix = 'Recording status' if ready else 'Data append paused; current data is kept'
++            print('\n' + prefix + ': ' + reason + '\n')
++            self._dagger_recording_notice = notice
++        return ready
++
++    def set_dagger_following(self, enabled):
++        """Gate native FA forwarding while a correction recording is stopped."""
++        message = String(data='resume_following' if enabled else 'pause_following')
++        self.master_left_config_pub.publish(message)
++        self.master_right_config_pub.publish(message)
++
++    def exit_dagger_mode(self):
++        """Restore exclusive policy control before allowing inference to resume."""
++        since = time.monotonic()
++        config_msg = String(data="slave")
++        self.master_left_config_pub.publish(config_msg)
++        self.master_right_config_pub.publish(config_msg)
++        self.wait_for_master_control(0xFC, False, since, quiet_period=0.25)
++        rospy.loginfo("Master slave-mode acknowledged and command publishers quiet; restoring policy control")
++
+     def enable_master_arms(self):
+         """Enable both master arms for DAgger mode"""
+         rospy.loginfo("🔧 Enabling left and right master arms for DAgger mode...")
+@@ -1603,7 +1995,7 @@
+         rospy.loginfo("✅ Both master arms enabled")
+         rospy.sleep(0.2)
+     
+-    def move_masters_to_slave_pose(self, duration=3.0):
++    def move_masters_to_slave_pose(self, duration=3.0, prepare_following=False):
+         """Move master arms to match current slave arm positions"""
+         rospy.loginfo("🎯 Moving master arms to match slave positions...")
+         
+@@ -1617,66 +2009,289 @@
+         
+         rospy.loginfo("Left slave pos: %s", left_slave_pos[:3])
+         rospy.loginfo("Right slave pos: %s", right_slave_pos[:3])
+-        
+-        # Create joint command messages
+-        joint_msg_left = JointState()
+-        joint_msg_left.header = Header()
+-        joint_msg_left.name = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+-        joint_msg_left.position = left_slave_pos
+-        joint_msg_left.velocity = [0.0] * 7
+-        joint_msg_left.effort = [0.0] * 7
+-        
+-        joint_msg_right = JointState()
+-        joint_msg_right.header = Header()
+-        joint_msg_right.name = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+-        joint_msg_right.position = right_slave_pos
+-        joint_msg_right.velocity = [0.0] * 7
+-        joint_msg_right.effort = [0.0] * 7
+-        
+-        # Publish commands continuously
+-        rate = rospy.Rate(10)  # 10Hz
+-        end_time = time.time() + duration
+-        
+-        while not rospy.is_shutdown() and time.time() < end_time:
+-            joint_msg_left.header.stamp = rospy.Time.now()
+-            joint_msg_right.header.stamp = rospy.Time.now()
+-            
+-            self.master_left_joint_pub.publish(joint_msg_left)
+-            self.master_right_joint_pub.publish(joint_msg_right)
+-            
++        return self._move_masters_to_pose(
++            left_slave_pos, right_slave_pos, duration, "slave pose", hold_seconds=3.0,
++            prepare_following=prepare_following)
++
++    def _move_masters_to_pose(self, left, right, duration, label, hold_seconds=0.0,
++                              prepare_following=False):
++        """Verify arrival, then optionally hold using fresh actual six-joint feedback."""
++        targets = {"left": left, "right": right}
++        try:
++            alignment_targets(targets)  # Reject malformed targets before publishing anything.
++            duration = float(duration)
++            if not math.isfinite(duration) or duration <= 0:
++                raise ValueError("Alignment duration must be finite and positive")
++            duration = max(3.0, duration)
++            hold_seconds = float(hold_seconds)
++            if not math.isfinite(hold_seconds) or hold_seconds < 0:
++                raise ValueError("Final-pose hold duration must be finite and nonnegative")
++        except (TypeError, ValueError, OverflowError) as exc:
++            rospy.logerr("Invalid master alignment target: %s", exc)
++            return False
++        messages = {}
++        for side in ("left", "right"):
++            message = JointState()
++            message.header = Header()
++            message.name = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
++            message.position = list(targets[side])
++            message.velocity = [0.0] * 7
++            message.effort = [0.0] * 7
++            messages[side] = message
++
++        def publish_final_targets():
++            for side in ("left", "right"):
++                messages[side].header.stamp = rospy.Time.now()
++            self.master_left_joint_pub.publish(messages["left"])
++            self.master_right_joint_pub.publish(messages["right"])
++
++        rate = rospy.Rate(10)
++        end_time = time.monotonic() + duration
++        while not rospy.is_shutdown() and time.monotonic() < end_time:
++            publish_final_targets()
+             rate.sleep()
+-        
+-        rospy.loginfo("✅ Master arms moved to slave positions")
+-        rospy.sleep(0.2)
++        if rospy.is_shutdown():
++            return False
++        report = wait_for_master_alignment(
++            targets, since_timestamp=time.time(), publish=publish_final_targets,
++            shutdown=rospy.is_shutdown, timeout=8.0, tolerance_mdeg=1000, stable_seconds=0.3)
++        arrived_at = time.monotonic()
++        if not hasattr(self, "master_alignment_reports"):
++            self.master_alignment_reports = {}
++        self.master_alignment_reports[label] = report
++        for side, row in report["sides"].items():
++            message = "%s %s master errors J1..J6 (deg): %s; gripper delta %.1f mm (diagnostic only)"
++            values = (label, side, [round(value, 3) for value in row["error_degrees"]],
++                      row["gripper_error_um"] / 1000.0)
++            if report["passed"]:
++                rospy.loginfo(message, *values)
++            else:
++                rospy.logerr(message, *values)
++        if not report["passed"]:
++            rospy.logerr("Master alignment failed at %s: %s; teaching remains blocked", label, report.get("error"))
++            return False
++        rospy.loginfo("Both masters' six actual joints converged at %s; gripper matching not verified", label)
++        if hold_seconds:
++            if prepare_following:
++                return self._hold_final_pose_and_prepare(
++                    targets, publish_final_targets, hold_seconds, arrived_at, label)
++            rospy.loginfo("Final master pose verified. Holding position for %.1f seconds before automatic teaching/recording...",
++                          hold_seconds)
++            hold_report = wait_for_master_alignment(
++                targets, since_timestamp=time.time(), publish=publish_final_targets,
++                shutdown=rospy.is_shutdown, timeout=hold_seconds + 1.5,
++                tolerance_mdeg=1000, stable_seconds=hold_seconds)
++            self.master_alignment_reports[label + " hold"] = hold_report
++            if not hold_report["passed"]:
++                rospy.logerr("Final master pose hold failed: %s; teaching/recording remain blocked",
++                             hold_report.get("error"))
++                return False
++            rospy.loginfo("Final master pose held and verified for %.1f seconds; switching to teaching next",
++                          hold_seconds)
+         return True
++
++    def _masters_prepared_current(self, since, wall_since):
++        now, wall_now = time.monotonic(), time.time()
++        with self.master_handoff_lock:
++            rows = {side: dict(row) for side, row in self.master_prepared_feedback.items()}
++        for side in ('left', 'right'):
++            row = rows.get(side)
++            if row is None:
++                return False
++            values = [row.get(key) for key in ('received_monotonic', 'source_time', 'phase_since',
++                                               'config', 'teaching', 'enabled')]
++            if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in values):
++                return False
++            if (row['received_monotonic'] < since or row['phase_since'] < wall_since
++                    or row['phase_since'] > wall_now + 0.05
++                    or row['phase_since'] > row['source_time'] + 0.05
++                    or not -0.05 <= now - row['received_monotonic'] < 0.5
++                    or not -0.05 <= wall_now - row['source_time'] < 0.5
++                    or row['config'] != 0xFC or row['teaching'] != 0 or row['enabled'] != 1):
++                return False
++        return True
++
++    def _check_preparation_cancelled(self, state):
++        if state['cancel'].is_set() or rospy.is_shutdown():
++            raise RuntimeError("Following preparation was cancelled; masters remain position-held")
++        if time.monotonic() >= state['deadline']:
++            raise RuntimeError("Parallel holding/following preparation exceeded its deadline")
++
++    def _prepare_following_worker(self, state):
++        try:
++            self._check_preparation_cancelled(state)
++            self.assert_followers_ready()
++            self._check_preparation_cancelled(state)
++            self.probe_followers_for_teaching(
++                timeout=min(3.0, state['deadline'] - time.monotonic()), cancel_event=state['cancel'])
++            self._check_preparation_cancelled(state)
++            since, wall_since = time.monotonic(), time.time()
++            state.update(requested_monotonic=since, requested_wall=wall_since)
++            message = String(data='prepare_master')
++            for side in ('left', 'right'):
++                self._check_preparation_cancelled(state)
++                getattr(self, 'master_' + side + '_config_pub').publish(message)
++            while not self._masters_prepared_current(since, wall_since):
++                self._check_preparation_cancelled(state)
++                time.sleep(0.02)
++            self._check_preparation_cancelled(state)
++            state.update(success=True, prepared_at=time.monotonic())
++        except BaseException as exc:
++            state['error'] = exc
++        finally:
++            state['done'].set()
++
++    def _start_following_preparation(self, started_at, timeout=15.0):
++        state = {'started_monotonic': started_at, 'started_wall': time.time(),
++                 'deadline': started_at + timeout, 'cancel': threading.Event(),
++                 'done': threading.Event(), 'success': False, 'hold_passed': False, 'error': None}
++        worker = threading.Thread(target=self._prepare_following_worker, args=(state,), daemon=True)
++        state['thread'] = worker
++        self.parallel_following_preparation = state
++        worker.start()
++        return state
++
++    def _following_preparation_guard(self, state):
++        self._check_preparation_cancelled(state)
++        if state['done'].is_set():
++            if state['error'] is not None:
++                raise RuntimeError("Following preparation failed: " + str(state['error'])) from state['error']
++            if not state['success']:
++                raise RuntimeError("Following preparation ended without readiness")
++        # Missing/stale/temporarily unprepared status only delays release.
++        # An explicit fresh fault/unknown mode or lost enable is stronger
++        # negative evidence, even if initial preparation has not completed.
++        if 'requested_monotonic' in state:
++            now, wall_now = time.monotonic(), time.time()
++            with self.master_handoff_lock:
++                rows = {side: dict(row) for side, row in self.master_prepared_feedback.items()}
++            for side, row in rows.items():
++                if (row['received_monotonic'] >= state['requested_monotonic']
++                        and 0 <= now - row['received_monotonic'] < 0.5
++                        and -0.05 <= wall_now - row['source_time'] < 0.5
++                        and (row['config'] != 0xFC or row['teaching'] != 0 or row['enabled'] != 1)):
++                    raise RuntimeError("Prepared master entered an invalid mode or lost enable: " + side)
++
++    def _following_preparation_ready(self, state):
++        self._following_preparation_guard(state)
++        return (state['done'].is_set() and state['success']
++                and self._masters_prepared_current(state['requested_monotonic'], state['requested_wall']))
++
++    def _hold_final_pose_and_prepare(self, targets, publish, hold_seconds, arrived_at, label):
++        """Hold and prepare concurrently; only their combined success can permit release."""
++        state = self._start_following_preparation(arrived_at, timeout=15.0)
++        hold_report = None
++        try:
++            rospy.loginfo("Final pose reached: holding %.1fs and preparing follower tracking concurrently", hold_seconds)
++            hold_report = wait_for_master_alignment(
++                targets, since_timestamp=time.time(), publish=publish, shutdown=rospy.is_shutdown,
++                timeout=max(0.01, state['deadline'] - time.monotonic()),
++                tolerance_mdeg=1000, stable_seconds=hold_seconds,
++                initial_stable_since=arrived_at,
++                guard=lambda: self._following_preparation_guard(state),
++                completion_ready=lambda: self._following_preparation_ready(state))
++            self.master_alignment_reports[label + ' hold'] = hold_report
++            if not hold_report['passed']:
++                rospy.logerr("Parallel final hold/preparation failed; teaching remains blocked: %s", hold_report.get('error'))
++                return False
++            self._following_preparation_guard(state)
++            state['hold_passed'] = True
++            rospy.loginfo("Final hold and both prepared follower paths verified; release may now be requested")
++            return True
++        finally:
++            if not state['hold_passed']:
++                state['cancel'].set()
++            remaining = max(0.0, state['deadline'] - time.monotonic())
++            state['thread'].join(timeout=min(0.25, remaining))
++
++    def release_prepared_masters(self):
++        gripper_test_side = os.environ.get('DAGGER_TEST_MASTER_GRIPPER_RELEASE', 'both')
++        state = getattr(self, 'parallel_following_preparation', None)
++        if state is None or not state['hold_passed']:
++            raise RuntimeError("The simultaneous final hold and preparation have not both completed")
++        # A brief loss of prepared status after the hold must not turn an
++        # otherwise healthy FC holding state into an exit. The original shared
++        # deadline and guard still reject faults, cancellation and timeout.
++        while not self._following_preparation_ready(state):
++            time.sleep(0.02)
++        # Validate the pair once before the commit. The first arm may report FA
++        # immediately; that expected transition must not prevent the second
++        # already-prepared arm from receiving the same release request.
++        for side in ('left', 'right'):
++            self._check_preparation_cancelled(state)
++            use_gripper_test = gripper_test_side == 'both' or (side == 'right' and gripper_test_side == 'right')
++            request = 'release_master_gripper' if use_gripper_test else 'release_master'
++            message = String(data=request)
++            getattr(self, 'master_' + side + '_config_pub').publish(message)
+     
++    def assert_followers_ready(self):
++        """Reject teaching requests before both physical follower paths are ready."""
++        topics = {side: getattr(self.args, 'puppet_arm_' + side + '_cmd_topic')
++                  for side in ('left', 'right')}
++        connections = {side: getattr(self, 'puppet_arm_' + side + '_publisher').get_num_connections()
++                       for side in ('left', 'right')}
++        self.follower_readiness_report = check_followers_ready(topics, connections)
++
++    def probe_followers_for_teaching(self, timeout=3.0, cancel_event=None):
++        """Prove both command callbacks work while masters still hold position.
++
++        Only repeat a single snapshot of the followers' actual positions. Stop
++        this probe before requesting master preparation so holding probes and native forwarding
++        cannot compete for the follower command topics.
++        """
++        if not math.isfinite(timeout) or timeout <= 0:
++            raise ValueError("Invalid follower holding-probe timeout")
++        targets = {}
++        for side in ('left', 'right'):
++            feedback = getattr(self, 'puppet_arm_' + side + '_deque')
++            if not feedback:
++                raise RuntimeError("No actual follower feedback for holding probe: " + side)
++            message = feedback[-1]
++            age = rospy.Time.now().to_sec() - message.header.stamp.to_sec()
++            if not math.isfinite(age) or not -0.05 <= age <= 0.25:
++                raise RuntimeError("Stale actual follower feedback for holding probe: " + side)
++            targets[side] = list(message.position)
++        alignment_targets(targets)
++        monotonic_since, wall_since = time.monotonic(), time.time()
++        deadline = monotonic_since + timeout
++        self.follower_probe_report = {'passed': False, 'targets': targets,
++                                      'started_at': wall_since}
++        last_error = 'No follower acknowledgement received'
++        while not rospy.is_shutdown() and time.monotonic() < deadline:
++            if cancel_event is not None and cancel_event.is_set():
++                raise RuntimeError("Follower holding probe was cancelled")
++            self.puppet_arm_publish(list(targets['left']), list(targets['right']), require_policy_inputs=False)
++            with self.master_handoff_lock:
++                heartbeats = dict(self.follower_ready_feedback)
++            now, wall_now = time.monotonic(), time.time()
++            try:
++                if any(heartbeats.get(side, {}).get('received_monotonic', -1) < monotonic_since
++                       for side in ('left', 'right')):
++                    raise RuntimeError('Both follower heartbeats must postdate this holding probe')
++                require_pair_ready(heartbeats, now_wall=wall_now, now_monotonic=now,
++                                   minimum_command_time=wall_since)
++            except RuntimeError as exc:
++                last_error = str(exc)
++            else:
++                self.follower_probe_report.update(passed=True, completed_at=wall_now)
++                return
++            time.sleep(0.1)
++        raise RuntimeError("Both followers must acknowledge fresh fixed-position commands before master release: "
++                           + last_error)
++
+     def switch_masters_to_teach_mode(self):
+-        """Switch master arms to teaching mode"""
+-        rospy.loginfo("🔄 Switching master arms to teaching mode...")
+-        
+-        # 1. Set master configuration
+-        rospy.loginfo("📍 Setting master configuration...")
++        """Request the driver-owned teaching transition; readiness is checked separately."""
++        self.assert_followers_ready()
++        self.probe_followers_for_teaching()
++        rospy.loginfo("Requesting master teaching configuration; waiting for both command streams...")
++
++        # The configuration callback enters drag teaching only after completing
++        # its transition, then opens master-command publishing. A concurrent
++        # teach=1 request would unlock the arms several seconds before followers
++        # can receive their commands.
+         config_msg = String(data="master")
+-        for i in range(3):
+-            self.master_left_config_pub.publish(config_msg)
+-            self.master_right_config_pub.publish(config_msg)
+-            rospy.loginfo("Config command %d/3", i+1)
+-            rospy.sleep(0.05)
+-        
+-        rospy.sleep(0.3)
+-        
+-        # 2. Enter drag teaching mode
+-        rospy.loginfo("📍 Entering drag teaching mode...")
+-        teach_msg = Int32(data=1)
+-        for i in range(3):
+-            self.master_left_teach_mode_pub.publish(teach_msg)
+-            self.master_right_teach_mode_pub.publish(teach_msg)
+-            rospy.loginfo("Teach mode command %d/3", i+1)
+-            rospy.sleep(0.05)
+-        
+-        rospy.loginfo("✅ Master arms in teaching mode")
+-        rospy.loginfo("🎉 You can now manually drag both master arms!")
+-        rospy.sleep(0.2)
++        self.master_left_config_pub.publish(config_msg)
++        self.master_right_config_pub.publish(config_msg)
+     
+     def move_masters_to_safe_pose(self, duration=3.0):
+         """Move master arms to safe intermediate position before matching slave"""
+@@ -1687,52 +2302,67 @@
+         safe_right = [0, 0.32, -0.36, 0, 0.24, 0, 0.07]
+         
+         rospy.loginfo("Safe position: %s", safe_left[:3])
+-        
+-        # Create joint command messages
+-        joint_msg_left = JointState()
+-        joint_msg_left.header = Header()
+-        joint_msg_left.name = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+-        joint_msg_left.position = safe_left
+-        joint_msg_left.velocity = [0.0] * 7
+-        joint_msg_left.effort = [0.0] * 7
+-        
+-        joint_msg_right = JointState()
+-        joint_msg_right.header = Header()
+-        joint_msg_right.name = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+-        joint_msg_right.position = safe_right
+-        joint_msg_right.velocity = [0.0] * 7
+-        joint_msg_right.effort = [0.0] * 7
+-        
+-        # Publish commands continuously
+-        rate = rospy.Rate(10)  # 10Hz
+-        end_time = time.time() + duration
+-        
+-        while not rospy.is_shutdown() and time.time() < end_time:
+-            joint_msg_left.header.stamp = rospy.Time.now()
+-            joint_msg_right.header.stamp = rospy.Time.now()
+-            
+-            self.master_left_joint_pub.publish(joint_msg_left)
+-            self.master_right_joint_pub.publish(joint_msg_right)
+-            
+-            remaining = end_time - time.time()
+-            if int(remaining) % 2 == 1 and remaining != int(remaining):
+-                rospy.loginfo("Moving to safe pose... %.1fs remaining", remaining)
+-            
+-            rate.sleep()
+-        
+-        rospy.loginfo("✅ Master arms at safe position")
+-        rospy.sleep(0.2)
+-        return True
++        return self._move_masters_to_pose(safe_left, safe_right, duration, "intermediate pose")
+     
+-    def enter_dagger_mode(self):
+-        """Enter DAgger mode: enable master arms, move to safe pose, then slave pose, enable teaching"""
++    def start_inference_collection(self):
++        """Start a fresh inference recording after startup or resuming with r."""
+         global process_thread, timesteps, actions, result_container
+-        process_thread.join()
+-        timesteps, actions = result_container.get('res', ([], []))
+-
+-        if len(actions) == 0:
+-            print("\033[31m\nNo data collected, skipping save.\033[0m")
+-            return
++        if process_thread is not None and process_thread.is_alive():
++            raise RuntimeError("Inference collection is already running")
++        timesteps, actions = [], []
++        result_container = {}
++        self.stop_flag = False
++        self._inference_unsaved = True
++        self._inference_save_path = None
++
++        def _run_process_and_store():
++            try:
++                result_container['res'] = self.process()
++            except Exception as exc:
++                # ROS Rate.sleep() raises during a normal shutdown. Keep the
++                # already collected prefix, while reporting real capture errors.
++                shutdown_interrupt = getattr(rospy, 'ROSInterruptException', ())
++                if not (isinstance(exc, shutdown_interrupt) and rospy.is_shutdown()):
++                    result_container['error'] = exc
++            finally:
++                result_container.setdefault('res', (timesteps, actions))
++
++        process_thread = threading.Thread(target=_run_process_and_store, daemon=False)
++        process_thread.start()
++
++    def stop_inference_collection(self, timeout=5.0, tail_seconds=0.0):
++        """Optionally sample the paused policy's real motion before stopping capture."""
++        global process_thread, result_container
++        try:
++            if tail_seconds > 0 and process_thread is not None:
++                deadline = time.monotonic() + tail_seconds
++                while (not self.stop_flag and process_thread.is_alive()
++                       and not rospy.is_shutdown() and 'error' not in result_container):
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        break
++                    time.sleep(min(0.01, remaining))
++        finally:
++            self.stop_flag = True
++        if process_thread is not None:
++            process_thread.join(timeout=timeout)
++            if process_thread.is_alive():
++                raise RuntimeError("Inference collection did not stop within the timeout")
++        if 'error' in result_container:
++            raise RuntimeError("Inference collection failed") from result_container['error']
++        return result_container.get('res', ([], []))
++
++    def save_inference_collection(self, frames, frame_actions):
++        """Save a stopped, unsaved inference segment once, without consuming it on failure."""
++        global process_thread
++        if process_thread is not None and process_thread.is_alive():
++            raise RuntimeError("Stop inference collection before saving")
++        if not getattr(self, '_inference_unsaved', True):
++            return None
++        if not frame_actions:
++            self._inference_unsaved = False
++            print("No unsaved inference frames to save.", flush=True)
++            return None
+ 
+         # Use path from RosOperator.__init__
+         base_data_dir = getattr(self.args, "dataset_dir", "/home/agilex/data")
+@@ -1759,33 +2389,75 @@
+                 next_idx = len(existing)
+ 
+         dataset_path = os.path.join(dataset_dir, f"episode_{next_idx}")
+-        save_data(self.args, timesteps, actions, dataset_path)
+-        print("\033[32m>>> Saved to: " + dataset_path + ".hdf5\033[0m")
++        # Reuse this segment's path if Ctrl+C interrupted its earlier export.
++        # save_data pops its inputs, so shallow copies keep the real prefix
++        # available for the exit save without copying the camera images.
++        dataset_path = getattr(self, '_inference_save_path', None) or dataset_path
++        self._inference_save_path = dataset_path
++        frame_count = len(frame_actions)
++        print(f"Saving inference: {frame_count} frames -> {dataset_path}.hdf5", flush=True)
++        save_data(self.args, list(frames), list(frame_actions), dataset_path)
++        self._inference_unsaved = False
++        frames.clear()
++        frame_actions.clear()
++        print(f"\033[32m>>> Saved inference: {dataset_path}.hdf5 ({frame_count} frames)\033[0m", flush=True)
++        return dataset_path
++
++    def stop_and_save_inference(self):
++        """Finish only inference recording; never enter teaching or issue robot commands."""
++        frames, frame_actions = self.stop_inference_collection()
++        return self.save_inference_collection(frames, frame_actions)
++
++    def enter_dagger_mode(self):
++        """Align masters, hold and prepare tracking concurrently, then acknowledge teaching."""
++        global process_thread, timesteps, actions, result_container
++        timesteps, actions = self.stop_inference_collection(tail_seconds=1.0)
++
++        if rospy.is_shutdown():
++            return False
++
++        if len(actions) == 0:
++            print("\033[31m\nNo data collected, skipping save.\033[0m")
++            return False
++
++        self.save_inference_collection(timesteps, actions)
+         print("\n" + "=" * 70)
+         print("🎯 ENTERING DAGGER MODE")
+         print("=" * 70)
+         self.stop_flag = True
+ 
+         # Then enter DAgger flow
+-        self.enable_master_arms()
+-        rospy.loginfo("\n🛡️ Safety Step: Moving to intermediate position...")
+-        if not self.move_masters_to_safe_pose(duration=3.0):
+-            print("\n❌ Failed to move master arms to safe position\n")
++        if rospy.is_shutdown():
+             return False
+-
+-        rospy.loginfo("\n🎯 Final Step: Matching slave positions...")
+-        if not self.move_masters_to_slave_pose(duration=3.0):
+-            print("\n❌ Failed to move master arms to slave position\n")
+-            return False
+-
+-        self.switch_masters_to_teach_mode()
++        self.start_dagger_preroll()
++        ready_at = None
++        try:
++            self.enable_master_arms()
++            rospy.loginfo("\n🛡️ Safety Step: Moving to intermediate position...")
++            if not self.move_masters_to_safe_pose(duration=3.0):
++                print("\n❌ Failed to move master arms to safe position\n")
++                return False
++
++            rospy.loginfo("\n🎯 Final Step: Matching slave positions...")
++            if not self.move_masters_to_slave_pose(duration=3.0, prepare_following=True):
++                print("\n❌ Failed to move master arms to slave position\n")
++                return False
++
++            if rospy.is_shutdown():
++                return False
++            since = time.monotonic()
++            self.release_prepared_masters()
++            self.wait_for_master_control(0xFA, True, since, timeout=None)
++            ready_at = rospy.Time.now().to_sec()
++        finally:
++            self.finish_dagger_preroll(ready_at)
+ 
+         print("\n" + "=" * 70)
+         print("✅ DAGGER MODE ACTIVE")
+         print("🎮 Drag master arms to control slave arms")
+         print("=" * 70 + "\n")
+-        print(f"Dataset name: {dataset_base}")
+-        print("Press Space to start collection")
++        print(f"Dataset name: {getattr(self, 'dataset_base', self.args.dataset_name)}")
++        print("Correction recording starts automatically now; no Space key is needed")
+         print("Press 's' during collection to save")
+         print("Press 'r' to exit DAgger and resume inference")
+         print("=" * 70 + "\n")
+@@ -1932,6 +2604,14 @@
+         self.robot_base_publisher = rospy.Publisher(self.args.robot_base_cmd_topic, Twist, queue_size=10)
+         
+         # DAgger mode - master arm subscribers and publishers
++        for side in ('left', 'right'):
++            rospy.Subscriber('/teach/follower_ready_' + side, Twist,
++                             self.follower_ready_callback, callback_args=side, queue_size=1,
++                             tcp_nodelay=True)
++            rospy.Subscriber('/teach/master_control_status_' + side, Twist,
++                             self.master_control_status_callback, callback_args=side, queue_size=1)
++            rospy.Subscriber(getattr(self.args, 'puppet_arm_' + side + '_cmd_topic'), JointState,
++                             self.master_command_callback, callback_args=side, queue_size=1, tcp_nodelay=True)
+         rospy.Subscriber(
+             "/puppet_master/joint_left",
+             JointState,
+@@ -1960,15 +2640,12 @@
+         global timesteps, actions
+         count = 0
+         rate = rospy.Rate(self.args.frame_rate)
+-        print("\033[36m>>> Collection started. Press Space to stop and save.\033[0m")
++        print("\033[36m>>> Inference collection started. Press d to stop and enter DAgger.\033[0m")
+ 
+         # --- 数据检测变量 (左右臂分离) ---
+         last_qpos_left, last_qpos_right = None, None
+         consecutive_unchanged_count_left, consecutive_unchanged_count_right = 0, 0
+         UNCHANGED_THRESHOLD = 100 # 连续100帧无变化则发出警告
+-
+-        # 启动后台线程监听空格
+-        threading.Thread(target=self.keyboard_listener, daemon=True).start()
+ 
+         while (count < self.args.max_timesteps + 1) and not rospy.is_shutdown() and not self.stop_flag:
+             result = self.get_frame()
+@@ -2027,7 +2704,7 @@
+             print("Frame data: ", count)
+             rate.sleep()
+ 
+-        print(f"\n>>> Collection ended, {len(actions)} frames, saving...")
++        print(f"\n>>> Inference capture ended, {len(actions)} frames ready for saving")
+         return timesteps, actions
+ 
+ def get_arguments():
+@@ -2370,29 +3047,17 @@
+     # Run ros_operator.process() in a background thread so model_inference can run concurrently.
+     # We run model_inference in the main thread so input()/keyboard handling works as intended.
+     
+-    def _run_process_and_store():
+-        result_container['res'] = ros_operator.process()
+-    process_thread = threading.Thread(target=_run_process_and_store, daemon=False)
+-    process_thread.start()
+-
+-    # Run inference (this uses input() and will start the keyboard monitor)
+-    model_inference(args, config, ros_operator)
+-
+-    # Wait for the process thread to finish and get collected data
+-    # process_thread.join()
+-    # timesteps, actions = result_container.get('res', ([], []))
+-
+-    # if len(actions) == 0:
+-    #     print("\033[31m\n未采集到任何数据，放弃保存。\033[0m")
+-    #     return
+-
+-    # dataset_dir = os.path.join(args.dataset_dir, args.dataset_name, args.task_name)
+-    # os.makedirs(dataset_dir, exist_ok=True)
+-    # dataset_path = os.path.join(dataset_dir, f"episode_{args.episode_idx}")
+-    # save_data(args, timesteps, actions, dataset_path)
+-    # print("\033[32m>>> 已保存至：", dataset_path + ".hdf5\033[0m")
++    ros_operator.start_inference_collection()
++
++    # The Bash owner stops arm forwarding before signalling this collector.
++    # Finish the already sampled inference prefix even after ROS shutdown or
++    # KeyboardInterrupt; no new observations or control commands are requested.
++    try:
++        model_inference(args, config, ros_operator)
++    finally:
++        ros_operator.stop_and_save_inference()
+ 
+ if __name__ == "__main__":
+     main()
+ 
+-    +    
+--- a/collect_data.py
++++ b/collect_data.py
+@@ -86,7 +86,7 @@
+             img = ts.observation['images'][cam]
+             # data_dict[f'/observations/images/{cam}'].append(img)
+             if args.export_video:
+-                video_img = img if img.shape[2] == 3 else cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
++                video_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                 if video_img.dtype != np.uint8:
+                     video_img = (video_img * 255).astype(np.uint8) if video_img.max() <= 1.0 else video_img.astype(np.uint8)
+                 video_images[cam].append(video_img)
+@@ -135,7 +135,6 @@
+         print(f'\033[32m\nVideo export done: {time.time() - t0:.1f} secs\033[0m')
+ 
+ # -------------- RosOperator --------------
+-from pynput import keyboard   # 方案 A：无需 root
+ 
+ class CollectOperator:
+     def __init__(self, args):
+@@ -160,6 +159,8 @@
+ 
+     # ---------- 后台线程：pynput 监听空格 ----------
+     def keyboard_listener(self):
++        from pynput import keyboard  # Standalone collector only; defer display access.
++
+         def on_press(key):
+             if key == keyboard.Key.space:
+                 self.stop_flag = True
+@@ -324,9 +325,9 @@
+                 dq.popleft()
+             return dq.popleft()
+ 
+-        img_left  = self.bridge.imgmsg_to_cv2(pop(self.img_left_deque), 'passthrough')
+-        img_right = self.bridge.imgmsg_to_cv2(pop(self.img_right_deque), 'passthrough')
+-        img_front = self.bridge.imgmsg_to_cv2(pop(self.img_front_deque), 'passthrough')
++        img_left  = self.bridge.imgmsg_to_cv2(pop(self.img_left_deque), 'bgr8')
++        img_right = self.bridge.imgmsg_to_cv2(pop(self.img_right_deque), 'bgr8')
++        img_front = self.bridge.imgmsg_to_cv2(pop(self.img_front_deque), 'bgr8')
+         master_arm_left  = pop(self.master_arm_left_deque)
+         master_arm_right = pop(self.master_arm_right_deque)
+         puppet_arm_left  = pop(self.puppet_arm_left_deque)

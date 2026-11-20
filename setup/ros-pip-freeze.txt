@@ -1,0 +1,95 @@
+absl-py==2.5.1
+actionlib==1.14.0
+attrs==26.1.0
+av @ file:///home/conda/feedstock_root/build_artifacts/av_1740887549107/work
+bcrypt @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_bcrypt_1793083729/work
+bondpy==1.8.6
+cached-property @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cached_property_1787678456/work
+catkin==0.8.10
+catkin_pkg @ file:///home/conda/feedstock_root/build_artifacts/catkin_pkg_1788990566345/work
+catkin_tools @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_catkin_tools_1743747521/work
+cffi @ file:///home/conda/feedstock_root/build_artifacts/cffi_1788485203316/work
+cryptography @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cryptography_1790790516/work
+cv_bridge==1.16.2
+defusedxml @ file:///home/conda/feedstock_root/build_artifacts/defusedxml_1615232257335/work
+diagnostic_updater==1.11.0
+distro @ file:///home/conda/feedstock_root/build_artifacts/distro_1734729835256/work
+dm-env==1.6
+dm-tree==0.1.9
+docutils @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_docutils_1779967837/work
+dynamic_reconfigure==1.7.3
+empy==3.3.4
+filelock==4.2.4
+fsspec==2026.9.0
+gencpp==0.7.0
+geneus==3.0.0
+genlisp==0.4.18
+genmsg==0.6.0
+gennodejs==2.0.2
+genpy==0.6.15
+h5py @ file:///home/conda/feedstock_root/build_artifacts/h5py_1734544953009/work
+invoke @ file:///home/conda/feedstock_root/build_artifacts/invoke_1775579537899/work
+Jinja2==3.1.6
+lz4 @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_lz4_1789242268/work
+MarkupSafe==3.0.3
+message_filters==1.17.0
+mpmath==1.3.0
+msgpack @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_msgpack-python_h4c6fd42_1793105652/work
+netifaces @ file:///home/conda/feedstock_root/build_artifacts/netifaces_1756921067673/work
+networkx==3.6.1
+nose @ file:///home/conda/feedstock_root/build_artifacts/nose_1602434998960/work
+numpy @ file:///home/conda/feedstock_root/build_artifacts/numpy_1707225376651/work/dist/numpy-1.26.4-cp311-cp311-linux_x86_64.whl#sha256=d08e1c9e5833ae7780563812aa73e2497db1ee3bd5510d3becb8aa18aa2d0c7c
+opencv-python==4.10.0
+opencv-python-headless==4.10.0
+osrf-pycommon @ file:///home/conda/feedstock_root/build_artifacts/osrf_pycommon_1626758968833/work
+packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
+paramiko @ file:///home/conda/feedstock_root/build_artifacts/paramiko_1792301831540/work
+pillow @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pillow_1792416406/work
+piper_sdk==0.6.2
+psutil @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_psutil_1789682042/work
+pycparser @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pycparser_1792687210/work
+pycryptodome @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pycryptodome_h194be0f_1794121934/work
+pycryptodomex @ file:///home/conda/feedstock_root/build_artifacts/pycryptodomex_1757744328386/work
+PyNaCl @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pynacl_1788957157/work
+pyparsing @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pyparsing_1790063282/work
+pyserial @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pyserial_1767289527/work
+python-can @ file:///home/conda/feedstock_root/build_artifacts/python-can_1754994944450/work
+python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_python-dateutil_h5ded981_1793535232/work
+python-gnupg @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_python-gnupg_1792683688/work
+PyYAML @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pyyaml_h108595a_1793655133/work
+rosbag==1.17.0
+rosboost_cfg==1.15.8
+rosclean==1.15.8
+roscreate==1.15.8
+rosdep @ file:///home/conda/feedstock_root/build_artifacts/rosdep_1761976211330/work
+rosdistro @ file:///home/conda/feedstock_root/build_artifacts/rosdistro_1788416073588/work
+rosgraph==1.17.0
+roslaunch==1.17.0
+roslib==1.15.8
+roslz4==1.17.0
+rosmake==1.15.8
+rosmaster==1.17.0
+rosmsg==1.17.0
+rosnode==1.17.0
+rosparam==1.17.0
+rospkg @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_rospkg_1789833266/work
+rospy==1.17.0
+rosservice==1.17.0
+rostest==1.17.0
+rostopic==1.17.0
+rosunit==1.15.8
+roswtf==1.17.0
+sensor_msgs==1.13.1
+six @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_six_1753199211/work
+smclib==1.8.6
+sympy==1.14.0
+tf==1.13.2
+tf2_py==0.7.7
+tf2_ros==0.7.7
+topic_tools==1.17.0
+torch==2.7.1+cpu
+typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1783002732/work
+tzdata @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_python-tzdata_h5ded981_1793205938/work
+websockets==15.0.1
+wrapt==1.17.3
+xacro==1.14.19

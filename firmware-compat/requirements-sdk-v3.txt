@@ -1,0 +1,1 @@
+piper_sdk==0.7.0a1 --hash=sha256:599677152cc8bed8e0dd11cec89f46e0e7e95b2b2be002ffe74d1459e17e4d51

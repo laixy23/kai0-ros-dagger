@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "device": {
+    "vendor": "16c0",
+    "product": "05e2",
+    "serial": "864032454065"
+  },
+  "bindings": {
+    "left": {
+      "interface": "usb-if00/input0/a83bb3898885",
+      "code": 2
+    },
+    "middle": {
+      "interface": "usb-if00/input0/a83bb3898885",
+      "code": 3
+    },
+    "right": {
+      "interface": "usb-if00/input0/a83bb3898885",
+      "code": 4
+    }
+  },
+  "calibration": {
+    "method": "press_count",
+    "required_presses": 3,
+    "measured_press_counts": {
+      "left": 3,
+      "middle": 3,
+      "right": 3
+    },
+    "measured_press_durations_s": {
+      "left": [
+        0.047984000004362315,
+        0.04797899999539368,
+        0.047995999979320914
+      ],
+      "middle": [
+        0.04796600001282059,
+        0.04797400001552887,
+        0.04799699998693541
+      ],
+      "right": [
+        0.0479860000195913,
+        0.048020999995060265,
+        0.047969000006560236
+      ]
+    },
+    "created_at_utc": "2026-11-12T03:46:18.667812+00:00"
+  }
+}

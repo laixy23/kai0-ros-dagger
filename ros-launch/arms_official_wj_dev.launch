@@ -1,0 +1,11 @@
+<launch>
+  <!-- MOTION-CAUSING: official mode=0 master initialization always enables. -->
+  <!-- auto_enable_slave=false does NOT make this launch passive. -->
+  <arg name="mode_master" default="false" />
+  <arg name="auto_enable_slave" default="true" />
+  <include file="$(find piper)/launch/start_ms_piper_new.launch">
+    <arg name="mode_master" value="$(arg mode_master)" />
+    <arg name="auto_enable_slave" value="$(arg auto_enable_slave)" />
+    <arg name="require_follower_ready" value="true" />
+  </include>
+</launch>

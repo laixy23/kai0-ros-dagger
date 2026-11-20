@@ -1,0 +1,46 @@
+wj-dev official ROS1 DAgger recovery, 2026-11-10
+
+Observed before recovery:
+- Ubuntu 24.04 userspace, kernel 7.0.0-42-generic.
+- RealSense SDK 2.50 / ROS camera 2.3.2 initially streamed three RGB cameras.
+- Later nodelet threads remained in usbdev_release / usbdev_do_ioctl, including
+  after stopping the camera service, SIGKILL and an on-site camera replug.
+- Even USB descriptor inspection blocked. Camera service was stopped.
+- Left master adapter re-enumerated as can0 DOWN; other three CAN links stayed UP.
+- No arm node, collector, mode change, enable or joint command was run in this
+  resumed session. Passive follower feedback checks passed with zero SDK instances.
+
+Before a host reboot:
+- Get explicit agreement from the on-site user; reboot interrupts SSH and GPU
+  inference. The observed GPU compute process was the official mixed_1 service.
+- Finish any source build before rebooting. Keep all arms supported and empty.
+- Keep automatic arm startup disabled. No arm or collector service is installed.
+
+After reconnecting:
+1. Read USB serial inventory and CAN identities again. Do not rely on can0/can1.
+2. On-site terminal restores network configuration only (requires local sudo):
+   sudo /usr/bin/python3 /home/rie/dev/xingyu.lai/inference-dagger/_deployment/bringup/activate_can_by_serial.py --apply
+   This maps the four confirmed serials to the official interface names at 1Mbps.
+   It does not enable motors or send application CAN frames.
+3. Restart the existing user model service explicitly:
+   systemctl --user start kai0-official-mixed1.service
+4. Recreate software-only roscore and camera services. Use the independently built
+   native-camera/run_native_ros.sh after its build receipt and library resolution
+   checks pass. Do not automatically fall back to the camera backend that locked.
+5. Recheck three real image streams, four passive CAN feedback channels, and
+   real observations against official mixed_1 with no action publisher.
+6. With the confirmed on-site support/clearance and freshly healthy feedback, prepare one supported
+   follower at a time, then launch the official arm nodes and inspect all7 topics.
+   The helper's default is passive; --apply disables/prepares/re-enables one arm.
+7. Start the interactive official collector only after the arm feedback checks.
+   Ctrl+C stops the official process but does not disable physical motors.
+
+Preserved checks:
+- Official released Task_A/mixed_1: verified22 files, model output50x14.
+- Real RGB/CAN-to-model smoke: three requests82-96ms, zero control writes.
+- Independent ROS master + real model: two d/Space/s/confirm/r cycles,4 HDF5,
+  12 RGB videos, master command ownership and fresh resumed model output passed.
+- Synthetic validation files remain under validation/runs and are not training data.
+
+Native camera build itself does not establish runtime stability on kernel7.0.
+Real multi-camera streaming must be checked after the USB kernel state is clear.

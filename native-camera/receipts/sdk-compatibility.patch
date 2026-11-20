@@ -1,0 +1,10 @@
+diff --git a/CMake/install_config.cmake b/CMake/install_config.cmake
+index 9f56666..34b7188 100644
+--- a/CMake/install_config.cmake
++++ b/CMake/install_config.cmake
+@@ -48,4 +48,4 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/config/realsense2.pc"
+         DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+ )
+ 
+-install(CODE "execute_process(COMMAND ldconfig)")
++# Project-local installation uses RPATH; never update the system linker cache.

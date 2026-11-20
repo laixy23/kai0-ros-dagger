@@ -1,0 +1,8 @@
+python 3.11.*
+numpy 1.26.4
+ros-distro-mutex 0.6
+libopencv 4.10.* headless*
+py-opencv 4.10.* headless*
+ros-noetic-cv-bridge 1.16.2 np126py311ha538b22_23
+cmake <4
+empy <4

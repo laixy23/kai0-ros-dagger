@@ -1,0 +1,264 @@
+{
+  "repository": "https://github.com/OpenDriveLab/kai0.git",
+  "commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+  "files": {
+    "agilex_openpi_dagger_collect.py": {
+      "upstream_path": "/Users/kl/kai0/train_deploy_alignment/dagger/agilex/agilex_openpi_dagger_collect.py",
+      "upstream_sha256": "6504d2e60460e04c12c3939f61764293924af3ad8842b1c867118f32914171fd",
+      "patched_sha256": "1f559d77ddcb8af2a00d1895d391dab0421f91efe2e833131bfb4cbca6c2668c"
+    },
+    "collect_data.py": {
+      "upstream_path": "/Users/kl/kai0/train_deploy_alignment/dagger/agilex/collect_data.py",
+      "upstream_sha256": "64c624cef355eb545d66d6c45bb06e43eea0434020235d466acb81e8542e4fb6",
+      "patched_sha256": "7ab8a3fc5503654ad95fda227b651d842ee3eebe6538bea907aaae420b3b5c38"
+    }
+  },
+  "compatibility_patch_sha256": "ccfdc274c092ba747be1db62f33422514a7e47f268de8519c1399a83eb0f8a23",
+  "automatic_dagger_recording": {
+    "final_target": "current follower pose",
+    "hold_seconds_after_verified_arrival": 3.0,
+    "hold_uses_fresh_actual_CAN_feedback": true,
+    "start_recording": "original FA-confirmed ready point with the preceding one second of real camera/follower samples prepended",
+    "space_required": false,
+    "hardware_motion_tested": false,
+    "hold_and_following_preparation_parallel": true,
+    "release_wait_after_arrival": "max(3 seconds of continuous verified holding, live following preparation elapsed)",
+    "preparation_request": "prepare_master (FC only, cannot release)",
+    "release_request": "release_master (only after both conditions)",
+    "overall_preparation_timeout_s": 15.0
+  },
+  "enabled_follower_startup": {
+    "automatic_disable_requested": false,
+    "already_disabled_follower": "normal startup preloads measured current pose and directly enables; no disable/reset fallback",
+    "mode2_transition": "hold fixed measured position while retaining all six motor enables",
+    "hardware_motion_tested": false,
+    "additional_drift_limit_enforced": false,
+    "automatic_enable_if_needed": true,
+    "enable_helper": "setup/enable_arm_current_pose.py"
+  },
+  "teaching_handoff": {
+    "early_parallel_teach_request": false,
+    "release_requires": "continuous verified hold >=3s and currently live dual six-joint FC preparation, followed by release_master",
+    "driver_checks": [
+      "native actual FC priming before FA release",
+      "native FA forwarding and follower acknowledgement before ready status"
+    ],
+    "failed_transition": "FC then fresh enabled actual pose, hold the newly observed current pose; never pull to an old alignment target",
+    "manual_disable": "immediate cancellation, latched until a new driver process",
+    "ready_requires": "both fresh master mode acknowledgements and command observations after this request; idle has no periodic stream requirement",
+    "hardware_motion_tested": false,
+    "runtime_recording": "bad/expired acknowledged mode pauses append without resetting buffers or moving; legal idle may record synchronized cameras/followers; unused master queues do not block synchronization",
+    "resume_failure": "keep existing session and data, keep policy paused, diagnose side/mode and accept a later explicit r; fold in-progress repeated r keys",
+    "preflight": "fresh follower feedback, transport and executed command acknowledgements; no ROS node-name-prefix or camera-age gate for the mechanical probe"
+  },
+  "isolated_driver": {
+    "files": {
+      "scripts/piper_start_ms_node_new.py": {
+        "source_path": "/home/rie/dev/kai0-task-a/train_deploy_alignment/dagger/agilex/src/piper/scripts/piper_start_ms_node_new.py",
+        "source_sha256": "9c0e5340082885d0f74ffc8b0c7ecb1965af41f56adb1a5b98be93d111d868d9",
+        "deployed_path": "ros_ws/src/piper/scripts/piper_start_ms_node_new.py",
+        "deployed_sha256": "a79ee14472c1ca4c25ccfc9e7398339cd57df947b8dac851e295204d209f112b"
+      },
+      "launch/start_ms_piper_new.launch": {
+        "source_path": "/home/rie/dev/kai0-task-a/train_deploy_alignment/dagger/agilex/src/piper/launch/start_ms_piper_new.launch",
+        "source_sha256": "8254211b7f636c2dc7cc383199b5a52a8b357ba5ef57ca8413a5323b378aa408",
+        "deployed_path": "ros_ws/src/piper/launch/start_ms_piper_new.launch",
+        "deployed_sha256": "d9d005808965dda910d83516e7ad9c7ae43d5af0cc37ca325ea220b4ada03272"
+      }
+    },
+    "patch": "setup/teaching-driver.patch",
+    "patch_sha256": "c8eff403ba5b4285ad8782f78c1a826da51f7120dbf5221f1d25a26c0d055929"
+  },
+  "enabled_master_startup": {
+    "helper": "setup/recover_master_enabled.py",
+    "automatic_enable_if_needed": true,
+    "enable_helper": "setup/enable_arm_current_pose.py",
+    "automatic_disable_reset_gripper_requested": false,
+    "legacy_torque_off_fallback": false,
+    "silent_fa_bootstrap": "one FC role request, then only passive native feedback until six motors enabled and actual pose verified",
+    "firmware_gate": "identifiable cached version >=1.8.9; no live firmware query",
+    "holding_target": "fresh native actual pose once before first target write, then fixed throughout recovery",
+    "additional_drift_limit_enforced": false,
+    "prepared_driver_startup": "passive CAN1 and six-enable verification; no repeated FC/Enable/motion writes",
+    "vendor_guidance": "https://github.com/agilexrobotics/pyAgxArm/discussions/53",
+    "pre_feedback_transient_verified": false,
+    "hardware_motion_tested": false
+  },
+  "native_follow_before_fa": {
+    "release_point": "MasterSlaveConfig(FA), not a later teach command",
+    "before_release": "forward fresh native actual FC poses and require both followers to acknowledge this priming source",
+    "after_release": "forward complete native155/156/157/159 immediately on an independent loop",
+    "managed_post_fa_enable_teach_or_fixed_sleep": false,
+    "native_source": "physical RX only; per-component kernel timestamps and handoff epochs",
+    "ready": "native FA source published and follower command-source acknowledgement received",
+    "failed_entry": "close forwarding; FC; verify fresh enabled actual pose; hold that new current pose",
+    "runtime_stream_loss": "after the first complete FA group, wait in the same phase before or after acknowledgement without an FA wait deadline; no replay or mode changes",
+    "physical_zero_latency_guaranteed": false,
+    "hardware_motion_tested": false,
+    "holding_overlaps_preparation": true,
+    "prepared_target_dimensions": "six joints only",
+    "gripper_alignment_error_blocks_entry": false,
+    "gripper_following_in_teaching": true,
+    "gripper_raw_and_command_separate": "signed raw abnormal bound +/-150000um; outgoing clamp0..80000um",
+    "missing_data_validation": "per-ID diagnostic added; complete native groups and freshness limits remain required",
+    "fa_first_complete_group_timeout_s": null,
+    "fa_pair_ack_deadline_s_from_phase_start": null,
+    "collector_fa_handoff_timeout_s": null,
+    "actual_first_group_timeout_s": 0.25,
+    "pre_ack_stream_loss_behavior": "recoverable waiting in the same FA epoch without a fixed deadline; existing shutdown and cancellation remain available",
+    "runtime_idle_notice_after_s": 0.25,
+    "runtime_idle_permanently_closes_forwarding": false,
+    "additional_first_fa_actual_priming_and_resume_pose_difference_limits": false,
+    "idle_evidence": "https://github.com/agilexrobotics/piper_sdk/issues/112#issuecomment-4515586181",
+    "startup_reference": "original role-configuration sleep2; no equivalent original native first-group timeout; added FA2s and pair-ACK2.5s deadlines removed",
+    "startup_release_limit": "FA already releases; waiting does not guarantee following or holding before native data arrives"
+  },
+  "usb_foot_pedal": {
+    "entry": "run_dagger_pedal.sh",
+    "original_bash_unchanged": false,
+    "original_bash_execution_unchanged": true,
+    "original_bash_sha256": "824b7e3c8401e7ab1696ae93b65217ee3be442f7f188d79e00e4f341b00e486c",
+    "identity": {
+      "vendor": "16c0",
+      "product": "05e2",
+      "serial": "864032454065"
+    },
+    "binding_source": "actual three-switch calibration in _runtime/foot-pedal.json",
+    "calibration": {
+      "method": "press_count",
+      "required_presses_per_pedal": 3
+    },
+    "mapping": {
+      "left_single": "d or post-save Space in confirmed teaching mode",
+      "middle_single": "s or confirmation only",
+      "middle_double": "w only in save confirmation",
+      "right_single": "r or confirmation only",
+      "right_double": "Ctrl+C without first requesting r"
+    },
+    "gesture_clock": "kernel CLOCK_MONOTONIC, preserve timestamps and sort queued events",
+    "double_press_window_s": 0.5,
+    "single_waits_for_double_window": [
+      "middle",
+      "right"
+    ],
+    "hold_duration_selects_action": false,
+    "input_isolation": "exclusive grab on this USB device, private command/readiness pipes",
+    "stop_owner": "signal only the owned foreground Bash group; original owner performs driver-first cleanup",
+    "hardware_motion_tested": false
+  },
+  "inference_tail_recording": {
+    "on_d_extra_seconds": 1.0,
+    "clock": "time.monotonic",
+    "start_boundary": "entering takeover at the former immediate capture-stop point",
+    "data_source": "existing live inference recorder; actual camera/follower observations",
+    "dataset": "inference_hdf5",
+    "extra_policy_execution_requested": false,
+    "transition_recording_added": false,
+    "ordinary_stop_extra_seconds": 0.0,
+    "shutdown_cancels_before_master_commands": true,
+    "fixed_sample_count_or_duplicate_padding": false,
+    "hardware_motion_tested": false
+  },
+  "inference_exit_recording": {
+    "on_exit": "stop and join capture, then save the unsaved inference segment and camera videos",
+    "stop_owner_order": "stop managed arm drivers before signalling the collector",
+    "data_source": "real captured follower and camera observations, no new policy execution",
+    "dataset": "inference_hdf5 with the next available episode index",
+    "extra_capture_wait_s": 0.0,
+    "saved_segment_deduplication": true,
+    "normal_ros_shutdown_retains_sampled_prefix": true,
+    "interrupted_writer": "retain original buffers and reuse the pending output path",
+    "correction_auto_save": false,
+    "first_stop_waits_for_export": true,
+    "stop_wait_drains_pty": true,
+    "second_ctrl_c": "force exit; incomplete exports may remain",
+    "hardware_motion_tested": false
+  },
+  "master_gripper_handoff": {
+    "status": "formal_default",
+    "entries": [
+      "run_dagger.sh",
+      "run_dagger_pedal.sh"
+    ],
+    "legacy_entry": "run_dagger_gripper_handoff_test.sh",
+    "default_enabled": true,
+    "selection": "unset DAGGER_TEST_MASTER_GRIPPER_RELEASE defaults to both; explicit right and empty/other legacy selections remain compatible",
+    "request": "release_master_gripper on each selected master",
+    "before_fa": "one gripper release per selected side in WIDTH mode at its own existing prepared native actual width, after original FA phase arming and before its role request",
+    "gripper_command": {
+      "effort": 0,
+      "code": 0,
+      "set_zero": 0
+    },
+    "new_gripper_acknowledgement_wait_s": 0.0,
+    "new_feedback_enable_fault_or_pose_difference_gate": false,
+    "new_follower_recheck_after_gripper_release": false,
+    "new_fc_pause_flag": false,
+    "new_experiment_recovery_or_cancellation_branch": false,
+    "new_gripper_restore_after_fc": false,
+    "fa_requires": "unchanged existing follower and native 155/156/157/159 checks",
+    "unsupported_environment_value": "use ordinary release requests",
+    "arm_disable_reset_or_zero_requested": false,
+    "save_holding_added": false,
+    "hardware_motion_tested": false,
+    "firmware_gripper_feedback_after_release_verified": false
+  },
+  "save_follower_pause": {
+    "save_actions": [
+      "keyboard s",
+      "middle pedal single"
+    ],
+    "pause_before": "capture stop, export and save confirmation, including empty save requests",
+    "control_channel": "existing master config String topics: pause_following/resume_following",
+    "effect": "pause native FA target publication on both masters; followers retain their last accepted joint and gripper targets",
+    "in_flight_commands": "already dispatched targets may complete; no physical instant-stop claim",
+    "resume": "only immediately before an actual post-save start_collection; Space/left pedal requests keep existing semantics",
+    "new_native_phase": "following publication enabled",
+    "fc_priming_and_policy_output_affected": false,
+    "master_teaching_mode_changed": false,
+    "new_sdk_hold_enable_disable_or_mode_write": false,
+    "new_ack_timeout_or_pose_gate": false,
+    "hardware_motion_tested": false
+  },
+  "dagger_preroll": {
+    "seconds_before_original_recording_start": 1.0,
+    "anchor": "existing FA-confirmed readiness, measured with rospy.Time.now",
+    "window": "[ready-1s, ready] using the original camera ROS source timestamps",
+    "sampling": "independent data-only worker with non-destructive five-stream snapshots after inference capture stop/join/save",
+    "data_sources": "three actual BGR camera images and both actual follower joint/gripper states",
+    "commit": "stop/join worker, original start_collection, then existing add_frame in source order",
+    "pairing": "existing FIRST/MID and next actual-state action pairing retained",
+    "live_handoff": "skip sources already imported by this prefix",
+    "whole_fa_wait_saved": false,
+    "new_fixed_wait_or_hardware_command": false,
+    "new_ack_timeout_or_pose_gate": false,
+    "missing_frame_padding": false,
+    "failed_or_interrupted_entry": "stop/join data worker and clear its pending prefix",
+    "post_save_restart_reuses_prefix": false,
+    "hardware_motion_tested": false
+  },
+  "startup_enable": {
+    "entries": [
+      "run_dagger.sh",
+      "run_dagger_pedal.sh",
+      "run_dagger_gripper_handoff_test.sh"
+    ],
+    "helper": "setup/enable_arm_current_pose.py",
+    "channels": [
+      "can_left_slave",
+      "can_right_slave",
+      "can_left_mas",
+      "can_right_mas"
+    ],
+    "trigger": "normal startup with complete normal native feedback showing disabled or partially enabled motors",
+    "target": "one fresh actual six-joint pose preloaded before enabling and reseeded after; not zero/initial pose",
+    "mode": "CAN1 if needed using the existing measured-pose exit-teach/position-control sequence",
+    "enable_command": "EnableArm(7), only if motors still need enabling",
+    "success": "actual six motor enable bits and original startup feedback verification, not a software flag or SDK return value",
+    "check_stop_or_ctrl_c_enables": false,
+    "disable_reset_gripper_or_initial_pose_requested": false,
+    "new_drift_or_pose_limit": false,
+    "silent_fa_recovery": "existing firmware-gated actual-feedback recovery; no blind enable without a native pose",
+    "hardware_motion_tested": false
+  }
+}
